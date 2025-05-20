@@ -30,12 +30,14 @@ struct KAgentMDP <: POMDPs.MDP{KAgentState, Symbol}
     w::Float64 # movement noise (in the angle, i.e. action, not in movement speed)
     menv::MuEnv # Observable environment process of the world
     v::Float64 # variance of environment observation noise process
+    γ::Float64 # discount factor
 
     KAgentMDP(name::String, start::Matrix,
               dimensions::Tuple, boxworld::Quadrangle,
               obj::Function,
               s::Float64, w::Float64,
-              menv::MuEnv, v::Float64) = new(name, start, dimensions, boxworld, obj, s, w, menv, v)
+              menv::MuEnv, v::Float64,
+              γ::Float64) = new(name, start, dimensions, boxworld, obj, s, w, menv, v, γ)
 end
 
 function KAgentMDP(;
@@ -45,8 +47,9 @@ function KAgentMDP(;
     s::Float64,
     w::Float64,
     menv::MuEnv,
-    v::Float64)
-    return KAgentMDP(name, start, dimensions, boxworld, obj, s, w, menv, v)
+    v::Float64,
+    γ::Float64)
+    return KAgentMDP(name, start, dimensions, boxworld, obj, s, w, menv, v, γ)
 end
 
 function init_standard_KAgentMDP(;
@@ -54,8 +57,8 @@ function init_standard_KAgentMDP(;
     dimensions::Tuple, obj::Function, menv::MuEnv)
     let d=dimensions
         KAgentMDP(name, start,
-                  dimensions, Quadrangle((d[1], d[1]), (d[1], d[2]), (d[2], d[1]), (d[2], d[2])),
-                  obj, 1., 0.05, menv, 0.05)
+                  d, Quadrangle((d[1], d[1]), (d[1], d[2]), (d[2], d[1]), (d[2], d[2])),
+                  obj, 1., 0.05, menv, 0.05, 0.95)
     end
 end
 
@@ -71,6 +74,8 @@ end
 POMDPs.isterminal(mdp::KAgentMDP, s::KAgentState) = mdp.obj(s)[2]
 
 POMDPs.initialstate(mdp::KAgentMDP) = Deterministic(blindstart_KAgentState(mdp.start))
+
+POMDPs.discount(mdp::KAgentMDP) = mdp.γ
 
 """Action space of the KAgentMDP.
 
@@ -91,7 +96,7 @@ action_heading_assoc_kagent = Dict([(:n,  normalize([1, 0])),
                                     (:c,  [0., 0.])])
 
 function POMDPs.gen(mdp::KAgentMDP, s::KAgentState, a::Symbol, rng)
-    real_a = reshape(rand(MvNormal(action_heading_assoc_kagent[a], mdp.w)), (1,:)) # real action factoring in noise
+    real_a = reshape(round.(rand(MvNormal(action_heading_assoc_kagent[a], mdp.w)), digits=2), (1,:)) # real action factoring in noise
     xp = @. s.x + real_a * mdp.s
     if Point(Tuple(xp)) ∉ mdp.boxworld
         xp = copy(s.x)
@@ -102,7 +107,7 @@ function POMDPs.gen(mdp::KAgentMDP, s::KAgentState, a::Symbol, rng)
 
     # POMDP observation refers to state observation. Noise will occur in the position of the vehicle
     # for simplicity doubling noise in observation of position with noise of movement
-    o_x = @. xp + reshape(rand(MvNormal([0.0, 0.0], mdp.w)), (1,:))
+    o_x = xp .+ reshape(round.(rand(MvNormal([0.0, 0.0], mdp.w)), digits=2), (1,:))
     #= o = KAgentState(o_x, zp, hist_p) =#
     r = mdp.obj(sp)[1]
     return (sp = sp, o = o_x, r = r)
