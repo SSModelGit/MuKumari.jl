@@ -4,7 +4,7 @@ export line_to_target_obj, time_till_completion_obj, safety_obj, combined_obj
 
 """Rewards based on closeness to goal.
 """
-function line_to_target_obj(s::KAgentState, target::Matrix; r_scaling=10., threshold=0.1)
+function line_to_target_obj(s::KAgentState, target::Matrix; r_scaling=100., threshold=0.1)
     d_to_target = norm(s.x - target)
     return [r_scaling * d_to_target, d_to_target < threshold]
 end

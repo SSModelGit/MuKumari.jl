@@ -28,13 +28,14 @@ struct MuEnv
     end
 end
 
-predict_μ(muenv::MuEnv, μ::Symbol, X::Matrix) = muenv.μf[μ](X)
+predict_μ(muenv::MuEnv, μ::Symbol, X::Matrix; rounding::Integer=2) = round(muenv.μf[μ](X); digits=rounding)
 
-predict_env(muenv::MuEnv, X::Matrix) = reshape([muenv.μf[μ](X) for μ in muenv.μ_order], muenv.M)
+predict_env(muenv::MuEnv, X::Matrix) = reshape([predict_μ(muenv, μ, X) for μ in muenv.μ_order], muenv.M)
 
 update_μf(muenv::MuEnv, μ::Symbol, f::Function) = muenv.μf[μ] = f
 
 include("intentional_agent.jl")
 include("basic_objectives.jl")
+include("basic_viz.jl")
 
 end

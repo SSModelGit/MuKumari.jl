@@ -20,6 +20,13 @@ function Base.:(==)(kag1::KAgentState, kag2::KAgentState)
     return kag1.x==kag2.x && kag1.z==kag2.z && kag1.hist==kag2.hist
 end
 
+function Base.show(io::IO, s::KAgentState)
+    println(io, "KAgent State")
+    println(io, "\tAgent Location: $(s.x)")
+    println(io, "\tEnvironment Observations @ location: $(s.z[end])")
+    println(io, "\tAgent Location History: $(s.hist)")
+end
+
 struct KAgentMDP <: POMDPs.MDP{KAgentState, Symbol}
     name::String
     start::Matrix # Grid location of starting pose of agent
@@ -85,14 +92,14 @@ Currently assumes constant motion speed.
 """
 POMDPs.actions(mdp::KAgentMDP) = [:n, :ne, :e, :se, :s, :sw, :w, :nw, :c]
 
-action_heading_assoc_kagent = Dict([(:n,  normalize([1, 0])),
-                                    (:ne, normalize([1, 1])),
-                                    (:e,  normalize([1, 0])),
-                                    (:se, normalize([1, 1])),
-                                    (:s,  normalize([1, 0])),
-                                    (:sw, normalize([1, 1])),
-                                    (:w,  normalize([1, 0])),
-                                    (:nw, normalize([1, 1])),
+action_heading_assoc_kagent = Dict([(:n,  normalize([ 0,  1])),
+                                    (:ne, normalize([ 1,  1])),
+                                    (:e,  normalize([ 1,  0])),
+                                    (:se, normalize([ 1, -1])),
+                                    (:s,  normalize([ 0, -1])),
+                                    (:sw, normalize([-1, -1])),
+                                    (:w,  normalize([-1,  0])),
+                                    (:nw, normalize([-1,  1])),
                                     (:c,  [0., 0.])])
 
 function POMDPs.gen(mdp::KAgentMDP, s::KAgentState, a::Symbol, rng)
@@ -102,7 +109,7 @@ function POMDPs.gen(mdp::KAgentMDP, s::KAgentState, a::Symbol, rng)
         xp = copy(s.x)
     end
     zp = push!(copy(s.z), predict_env(mdp.menv, xp))
-    hist_p = push!(copy(s.hist), xp)
+    hist_p = push!(copy(s.hist), s.x)
     sp = KAgentState(xp, zp, hist_p)
 
     # POMDP observation refers to state observation. Noise will occur in the position of the vehicle
