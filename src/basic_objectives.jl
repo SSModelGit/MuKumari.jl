@@ -39,13 +39,6 @@ function line_to_target_obj(s::KAgentState, goal::Dict)
     return Any[goal[:strength] * exp(-d_to_target^2 / goal[:influence]), d_to_target < goal[:size]]
 end
 
-# """Rewards based on closeness to goal.
-# """
-# function line_to_target_obj(s::KAgentState, target::Matrix; r_scaling=100., range_of_influence=10, threshold=0.5)
-#     d_to_target = norm(s.x - target)
-#     return Any[r_scaling * exp(-d_to_target^2 / range_of_influence), d_to_target < threshold]
-# end
-
 time_till_completion_obj(s::KAgentState, urgency::Float64) = Any[- urgency * length(s.hist), missing]
 
 """Goal-avoidance behavior. Takes a vector of obstacle descriptors.
@@ -70,21 +63,6 @@ function safety_obj(s::KAgentState, obstacles::Vector)
         return [-total_risk, collided]
     end
 end
-
-# """Goal-avoidance behavior.
-
-# Currently very simple, just checks if in obstacle or not.
-# """
-# function safety_obj(s::KAgentState, obstacles::Vector; r_scaling=10.)
-#     let x = Point(Tuple(s.x))
-#         for obstacle in obstacles
-#             if x ∈ obstacle
-#                 return Any[-r_scaling, false]
-#             end
-#         end
-#         return [0, missing]
-#     end
-# end
 
 combined_reward(r::Vector) = mapreduce(c->c[1], +, r)
 combined_termination_check(b::BitVector) = any(b) & all(b)

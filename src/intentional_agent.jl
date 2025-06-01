@@ -2,7 +2,6 @@
 
 using LinearAlgebra: normalize
 using Distributions: Normal, MvNormal
-using Meshes: Point, Vec, Quadrangle
 using POMDPTools, MCTS
 
 import GeoInterface as GI
@@ -64,8 +63,6 @@ function KAgentMDP(;
     return KAgentMDP(name, start, dimensions, boxworld, obj, s, w, menv, v, γ, digits)
 end
 
-# boxworld=Quadrangle((d[1], d[1]), (d[2], d[1]), (d[2], d[2]), (d[1], d[2])),
-
 function init_standard_KAgentMDP(;
     name::String, start::Matrix,
     dimensions::Tuple, obj::Function, menv::MuEnv)
@@ -115,9 +112,6 @@ action_heading_assoc_kagent = Dict([(:n,  normalize([ 0,  1])),
 function POMDPs.gen(mdp::KAgentMDP, s::KAgentState, a::Symbol, rng)
     real_a = reshape(round.(rand(MvNormal(action_heading_assoc_kagent[a], mdp.w)), digits=mdp.digits), (1,:)) # real action factoring in noise
     xp = @. s.x + real_a * mdp.s
-    # if Point(Tuple(xp)) ∉ mdp.boxworld
-    #     xp = copy(s.x)
-    # end
     if GO.distance(GI.Point(Tuple(xp)), mdp.boxworld) > 0
         xp = copy(s.x)
     end
@@ -128,7 +122,7 @@ function POMDPs.gen(mdp::KAgentMDP, s::KAgentState, a::Symbol, rng)
     # POMDP observation refers to state observation. Noise will occur in the position of the vehicle
     # for simplicity doubling noise in observation of position with noise of movement
     o_x = xp .+ reshape(round.(rand(MvNormal([0.0, 0.0], mdp.w)), digits=mdp.digits), (1,:))
-    #= o = KAgentState(o_x, zp, hist_p) =#
+    
     r = mdp.obj(sp)[1]
     return (sp = sp, o = o_x, r = r)
 end

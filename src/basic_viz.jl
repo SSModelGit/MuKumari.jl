@@ -1,25 +1,11 @@
-# Using Point from Meshes (imported in intentional_agent.jl)
-using Meshes: viz, viz!
-# import CairoMakie as mke
-using CairoMakie
+using CairoMakie: Figure, Axis, DataAspect, poly!, arrows!, Circle, Point2f, Vec2f
 
+# Still not sure if this is the best way to handle plot sizing
 const global inch::Float64 = 96
 const global cm::Float64 = inch / 2.54
 const global pt::Float64 = 4 / 3
 
 export viz_system_single_timestep, viz_system_sim, stepthrough_sim
-
-# """Return a base Makie FigurePlotAxis object with obstacles and goals plotted.
-
-# Users must provide both as vectors.
-# """
-# function viz_env(obcs::Vector, goals::Vector)
-#     mvz = viz(obcs)
-#     viz!(goals, pointsize=20; pointcolor = :red)
-
-#     # Currently nothing else to vizualize.
-#     mvz
-# end
 
 function viz_obcs(ax, obcs::Vector)
     for obc in obcs
@@ -57,20 +43,6 @@ function viz_system_single_timestep(mdp::KAgentMDP, s::KAgentState, a::Symbol, o
     viz_agent_status(ax, s, a)
     f
 end
-
-# """Single timestep vizualization of the system. Currently single agent.
-
-# Users must provide the obstacles as a vector.
-# """
-# function viz_system_single_timestep(obcs::Vector, goals::Vector, s::KAgentState, a::Symbol)
-#     mvz = viz_env(obcs, goals)
-
-#     viz!(Point(Tuple(s.x)), pointsize=20)
-#     mke.arrows!([mke.Point2f(Tuple(s.x))], [mke.Vec2f(Tuple(action_heading_assoc_kagent[a]))],
-#                 lengthscale = 0.3)
-
-#     mvz
-# end
 
 function viz_system_sim(mdp::KAgentMDP, objs::ObjectiveLandscape, sim_trace::Vector)
     f, ax = viz_agent_worldview(mdp, objs)
