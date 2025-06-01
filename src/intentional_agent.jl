@@ -112,9 +112,12 @@ action_heading_assoc_kagent = Dict([(:n,  normalize([ 0,  1])),
 function POMDPs.gen(mdp::KAgentMDP, s::KAgentState, a::Symbol, rng)
     real_a = reshape(round.(rand(MvNormal(action_heading_assoc_kagent[a], mdp.w)), digits=mdp.digits), (1,:)) # real action factoring in noise
     xp = @. s.x + real_a * mdp.s
-    if GO.distance(GI.Point(Tuple(xp)), mdp.boxworld) > 0
-        xp = copy(s.x)
-    end
+    isoutside = GO.distance(GI.Point(Tuple(xp)), mdp.boxworld) > 0
+    world_intersect = GO.intersection(GI.LineString([GI.Point(Tuple(s.x)), GI.Point(Tuple(xp))]), GI.getexterior(mdp.boxworld); target=GI.PointTrait())
+    xp = (!isempty(world_intersect) && isoutside) ? reshape(collect(world_intersect[end]), (1,:)) : xp
+    # if GO.distance(GI.Point(Tuple(xp)), mdp.boxworld) > 0
+    #     xp = copy(s.x)
+    # end
     zp = push!(copy(s.z), predict_env(mdp.menv, xp))
     hist_p = push!(copy(s.hist), s.x)
     sp = KAgentState(xp, zp, hist_p)
