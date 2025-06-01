@@ -5,6 +5,9 @@ using Distributions: Normal, MvNormal
 using Meshes: Point, Vec, Quadrangle
 using POMDPTools, MCTS
 
+import GeoInterface as GI
+import GeometryOps as GO
+
 export KAgentState, blindstart_KAgentState, KAgentMDP, init_standard_KAgentMDP
 export KWorld, create_empty_kworld, add_agent_to_world, get_num_agents
 
@@ -31,41 +34,48 @@ struct KAgentMDP <: POMDPs.MDP{KAgentState, Symbol}
     name::String
     start::Matrix # Grid location of starting pose of agent
     dimensions::Tuple # Dimensions of 2D grid-world
-    boxworld::Quadrangle # 2D world constructed from dimensions
+    boxworld::GI.Polygon # 2D world constructed from dimensions
     obj::Function # objective function: must return two values, [Immediate reward for reaching state (KAgentState), Boolean True if Objective Accomplished]
     s::Float64 # movement speed
     w::Float64 # movement noise (in the angle, i.e. action, not in movement speed)
     menv::MuEnv # Observable environment process of the world
     v::Float64 # variance of environment observation noise process
     γ::Float64 # discount factor
+    digits::Integer # rounding factor
 
     KAgentMDP(name::String, start::Matrix,
-              dimensions::Tuple, boxworld::Quadrangle,
+              dimensions::Tuple, boxworld::GI.Polygon,
               obj::Function,
               s::Float64, w::Float64,
               menv::MuEnv, v::Float64,
-              γ::Float64) = new(name, start, dimensions, boxworld, obj, s, w, menv, v, γ)
+              γ::Float64, digits::Integer) = new(name, start, dimensions, boxworld, obj, s, w, menv, v, γ, digits)
 end
 
 function KAgentMDP(;
     name::String, start::Matrix,
-    dimensions::Tuple, boxworld::Quadrangle,
+    dimensions::Tuple, boxworld::GI.Polygon,
     obj::Function,
     s::Float64,
     w::Float64,
     menv::MuEnv,
     v::Float64,
-    γ::Float64)
-    return KAgentMDP(name, start, dimensions, boxworld, obj, s, w, menv, v, γ)
+    γ::Float64,
+    digits::Integer)
+    return KAgentMDP(name, start, dimensions, boxworld, obj, s, w, menv, v, γ, digits)
 end
+
+# boxworld=Quadrangle((d[1], d[1]), (d[2], d[1]), (d[2], d[2]), (d[1], d[2])),
 
 function init_standard_KAgentMDP(;
     name::String, start::Matrix,
     dimensions::Tuple, obj::Function, menv::MuEnv)
     let d=dimensions
-        KAgentMDP(name, start,
-                  d, Quadrangle((d[1], d[1]), (d[1], d[2]), (d[2], d[1]), (d[2], d[2])),
-                  obj, 1., 0.05, menv, 0.05, 0.95)
+        KAgentMDP(name=name, start=start,
+                  dimensions=d,
+                  boxworld=GI.Polygon([[(d[1], d[1]), (d[1], d[2]), (d[2], d[2]), (d[2], d[1]), (d[1], d[1])]]),
+                  obj=obj,
+                  s=1., w=0.05, menv=menv, v=0.05, γ=0.95,
+                  digits=3)
     end
 end
 
@@ -80,7 +90,7 @@ end
 
 POMDPs.isterminal(mdp::KAgentMDP, s::KAgentState) = mdp.obj(s)[2]
 
-POMDPs.initialstate(mdp::KAgentMDP) = Deterministic(blindstart_KAgentState(mdp.start))
+POMDPs.initialstate(mdp::KAgentMDP) = Deterministic(blindstart_KAgentState(mdp, mdp.start))
 
 POMDPs.discount(mdp::KAgentMDP) = mdp.γ
 
@@ -103,9 +113,12 @@ action_heading_assoc_kagent = Dict([(:n,  normalize([ 0,  1])),
                                     (:c,  [0., 0.])])
 
 function POMDPs.gen(mdp::KAgentMDP, s::KAgentState, a::Symbol, rng)
-    real_a = reshape(round.(rand(MvNormal(action_heading_assoc_kagent[a], mdp.w)), digits=2), (1,:)) # real action factoring in noise
+    real_a = reshape(round.(rand(MvNormal(action_heading_assoc_kagent[a], mdp.w)), digits=mdp.digits), (1,:)) # real action factoring in noise
     xp = @. s.x + real_a * mdp.s
-    if Point(Tuple(xp)) ∉ mdp.boxworld
+    # if Point(Tuple(xp)) ∉ mdp.boxworld
+    #     xp = copy(s.x)
+    # end
+    if GO.distance(GI.Point(Tuple(xp)), mdp.boxworld) > 0
         xp = copy(s.x)
     end
     zp = push!(copy(s.z), predict_env(mdp.menv, xp))
@@ -114,7 +127,7 @@ function POMDPs.gen(mdp::KAgentMDP, s::KAgentState, a::Symbol, rng)
 
     # POMDP observation refers to state observation. Noise will occur in the position of the vehicle
     # for simplicity doubling noise in observation of position with noise of movement
-    o_x = xp .+ reshape(round.(rand(MvNormal([0.0, 0.0], mdp.w)), digits=2), (1,:))
+    o_x = xp .+ reshape(round.(rand(MvNormal([0.0, 0.0], mdp.w)), digits=mdp.digits), (1,:))
     #= o = KAgentState(o_x, zp, hist_p) =#
     r = mdp.obj(sp)[1]
     return (sp = sp, o = o_x, r = r)
