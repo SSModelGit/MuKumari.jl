@@ -7,7 +7,7 @@ using POMDPTools, MCTS
 import GeoInterface as GI
 import GeometryOps as GO
 
-export KAgentState, blindstart_KAgentState, KAgentMDP, init_standard_KAgentMDP
+export KAgentState, blindstart_KAgentState, pseudo_agent_placement,KAgentMDP, init_standard_KAgentMDP
 export KWorld, create_empty_kworld, add_agent_to_world, get_num_agents
 
 struct KAgentState
@@ -76,7 +76,17 @@ function init_standard_KAgentMDP(;
     end
 end
 
+"""Start the agent at a desired location.
+
+The agent starts unaware of the world beyond its immediate location.
+"""
 blindstart_KAgentState(mdp::KAgentMDP, x::Matrix) = KAgentState(x, [predict_env(mdp.menv, x)], Matrix[])
+
+"""Shifts an agent instantaneously to any arbitrary desired location.
+
+Note that this violates the agent dynamics.
+"""
+pseudo_agent_placement(s::KAgentState, x::Matrix) = KAgentState(x, copy(s.z), copy(s.hist))
 
 function Base.show(io::IO, mdp::KAgentMDP)
     println(io, "KAgent MDP")
