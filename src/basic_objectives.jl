@@ -35,8 +35,8 @@ ObjectiveLandscape(; objectives) = ObjectiveLandscape(objectives)
 """Rewards based on closeness to goal.
 """
 function line_to_target_obj(s::KAgentState, goal::Dict)
-    d_to_target = norm(s.x - goal[:target])
-    return Any[goal[:strength] * exp(-d_to_target^2 / goal[:influence]), d_to_target < goal[:size]]
+    dist = norm(s.x - goal[:target])
+    return Any[goal[:strength] * exp(-dist^2 / goal[:influence]^2), dist < goal[:size]]
 end
 
 time_till_completion_obj(s::KAgentState, urgency::Float64) = Any[- urgency * length(s.hist), missing]
@@ -46,8 +46,9 @@ time_till_completion_obj(s::KAgentState, urgency::Float64) = Any[- urgency * len
 Currently computes the "risk" of the agent in approaching an obstacle.
 
 Each component of the vector is a dictionary holding two objects:
-* :poly => The vector of tuple-coordinates that represent the polygon. Must be closed!
-* :risk => The "risk"-scaling factor; scales the shortest distance between a point and obstacle.
+* :poly   => The vector of tuple-coordinates that represent the polygon. Must be closed!
+* :risk   => The "risk"-scaling factor; scales the shortest distance between a point and obstacle.
+* :impact => The amount by which an agent is penalized for entering an obstacle.
 
 ex: Dict(:poly => [(0.,0.), (0., 1.), (1., 1.), (1., 0.), (0., 0.)], :risk => 10.)
 """
@@ -58,7 +59,8 @@ function safety_obj(s::KAgentState, obstacles::Vector)
             if dist <= 0.
                 collided = true
             end
-            total_risk += dist * obstacle[:risk]
+            total_risk += obstacle[:impact] * exp(-dist^2 / obstacle[:risk])
+            # total_risk += dist * obstacle[:risk]
         end
         return [-total_risk, collided]
     end

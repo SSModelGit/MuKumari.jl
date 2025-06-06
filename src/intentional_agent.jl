@@ -1,7 +1,8 @@
 @reexport using POMDPs
 
-using LinearAlgebra: normalize
+using LinearAlgebra: normalize, ⋅
 using Distributions: Normal, MvNormal
+using IterTools: partition
 using POMDPTools, MCTS
 
 import GeoInterface as GI
@@ -119,12 +120,49 @@ action_heading_assoc_kagent = Dict([(:n,  normalize([ 0,  1])),
                                     (:nw, normalize([-1,  1])),
                                     (:c,  [0., 0.])])
 
+function stay_in_boundary(xs::Matrix, xp::Matrix, pgon; new_partition=nothing, debug::Bool=false, tol=1e-5)
+    if GO.distance(GI.Point(Tuple(xp)), pgon) > tol
+        println("Offending point: ", xp, "| Stated distance: ", GO.distance(GI.Point(Tuple(xp)), pgon), " | Polygon: ", pgon)
+        let boundary = GI.getexterior(pgon), movement = GI.LineString([GI.Point(Tuple(xs)), GI.Point(Tuple(xp))]), new_boundary = [], found_intersect = false
+            st_v=copy(xs)
+            part = isnothing(new_partition) ? partition(boundary.geom, 2, 1) : new_partition
+            for line in part
+                linestring = GI.LineString([GI.Point(line[1]), GI.Point(line[2])])
+                intersect = GO.intersection(movement, linestring; target=GI.PointTrait())
+                println("Partition: ", line,"| Line: ", linestring, "| Intersections: ", intersect)
+                if !(isempty(intersect) || found_intersect)
+                    found_intersect = true
+                    st_v = reshape(collect(intersect[end]), (1,:))
+                    end_v = reshape(collect(GI.getcoord(GI.getpoint(linestring)[2])), (1,:))
+                    inter_h = normalize(end_v - st_v)
+                    mvt_v = xp - st_v
+                    xp = (mvt_v ⋅ inter_h) .* inter_h .+ st_v
+                    if debug
+                        inter_v = end_v - st_v
+                        println("Found the intersection: ", st_v)
+                        println("Vector of movement: ", mvt_v)
+                        println("Vector of intercepted side: ", inter_v)
+                        println("The rest of the movement then is: ", (mvt_v ⋅ inter_h) .* inter_h)
+                        println("Final endpoint is: ", (mvt_v ⋅ inter_h) .* inter_h .+ st_v)
+                    end
+                else
+                    push!(new_boundary, line)
+                end
+            end
+            return stay_in_boundary(st_v, xp, pgon; new_partition=new_boundary, debug=debug)
+        end
+    else
+        return xp
+    end
+end
+
 function POMDPs.gen(mdp::KAgentMDP, s::KAgentState, a::Symbol, rng)
     real_a = reshape(round.(rand(MvNormal(action_heading_assoc_kagent[a], mdp.w)), digits=mdp.digits), (1,:)) # real action factoring in noise
     xp = @. s.x + real_a * mdp.s
-    isoutside = GO.distance(GI.Point(Tuple(xp)), mdp.boxworld) > 0
-    world_intersect = GO.intersection(GI.LineString([GI.Point(Tuple(s.x)), GI.Point(Tuple(xp))]), GI.getexterior(mdp.boxworld); target=GI.PointTrait())
-    xp = (!isempty(world_intersect) && isoutside) ? reshape(collect(world_intersect[end]), (1,:)) : xp
+    xp = stay_in_boundary(s.x, xp, mdp.boxworld)
+    # isoutside = GO.distance(GI.Point(Tuple(xp)), mdp.boxworld) > 0
+    # world_intersect = GO.intersection(GI.LineString([GI.Point(Tuple(s.x)), GI.Point(Tuple(xp))]), GI.getexterior(mdp.boxworld); target=GI.PointTrait())
+    # xp = (!isempty(world_intersect) && isoutside) ? reshape(collect(world_intersect[end]), (1,:)) : xp
     # if GO.distance(GI.Point(Tuple(xp)), mdp.boxworld) > 0
     #     xp = copy(s.x)
     # end
