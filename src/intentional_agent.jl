@@ -5,36 +5,16 @@ using Distributions: Normal, MvNormal
 using IterTools: partition
 using POMDPTools, MCTS
 
-import GeoInterface as GI
-import GeometryOps as GO
-
-export KAgentState, blindstart_KAgentState, pseudo_agent_placement,KAgentMDP, init_standard_KAgentMDP
+export blindstart_KAgentState, pseudo_agent_placement,KAgentMDP, init_standard_KAgentMDP
 export KWorld, create_empty_kworld, add_agent_to_world, get_num_agents
-
-struct KAgentState
-    x::Matrix
-    z::Vector
-    hist::Vector
-
-    KAgentState(x::Matrix, z::Vector, hist::Vector) = new(x, z, hist)
-end
-
-function Base.:(==)(kag1::KAgentState, kag2::KAgentState)
-    return kag1.x==kag2.x && kag1.z==kag2.z && kag1.hist==kag2.hist
-end
-
-function Base.show(io::IO, s::KAgentState)
-    println(io, "KAgent State")
-    println(io, "\tAgent Location: $(s.x)")
-    println(io, "\tEnvironment Observations @ location: $(s.z[end])")
-    println(io, "\tAgent Location History: $(s.hist)")
-end
 
 struct KAgentMDP <: POMDPs.MDP{KAgentState, Symbol}
     name::String
     start::Matrix # Grid location of starting pose of agent
     dimensions::Tuple # Dimensions of 2D grid-world
     boxworld::GI.Polygon # 2D world constructed from dimensions
+    obcs::Vector # 2D world obstacles (holes in the traversable region)
+    world::GI.Polygon # Effectively traversable 2D world (built from boxworld and obcs)
     obj::Function # objective function: must return two values, [Immediate reward for reaching state (KAgentState), Boolean True if Objective Accomplished]
     s::Float64 # movement speed
     w::Float64 # movement noise (in the angle, i.e. action, not in movement speed)
@@ -45,15 +25,17 @@ struct KAgentMDP <: POMDPs.MDP{KAgentState, Symbol}
 
     KAgentMDP(name::String, start::Matrix,
               dimensions::Tuple, boxworld::GI.Polygon,
+              obcs::Vector, world::GI.Polygon,
               obj::Function,
               s::Float64, w::Float64,
               menv::MuEnv, v::Float64,
-              γ::Float64, digits::Integer) = new(name, start, dimensions, boxworld, obj, s, w, menv, v, γ, digits)
+              γ::Float64, digits::Integer) = new(name, start, dimensions, boxworld, obcs, world, obj, s, w, menv, v, γ, digits)
 end
 
 function KAgentMDP(;
     name::String, start::Matrix,
     dimensions::Tuple, boxworld::GI.Polygon,
+    obcs::Vector, world::GI.Polygon,
     obj::Function,
     s::Float64,
     w::Float64,
@@ -61,19 +43,19 @@ function KAgentMDP(;
     v::Float64,
     γ::Float64,
     digits::Integer)
-    return KAgentMDP(name, start, dimensions, boxworld, obj, s, w, menv, v, γ, digits)
+    return KAgentMDP(name, start, dimensions, boxworld, obcs, world, obj, s, w, menv, v, γ, digits)
 end
 
 function init_standard_KAgentMDP(;
     name::String, start::Matrix,
-    dimensions::Tuple, obj::Function, menv::MuEnv)
-    let d=dimensions
+    dimensions::Tuple, objl::ObjectiveLandscape, menv::MuEnv, digits::Integer=3)
+    let d=dimensions, boxworld=GI.Polygon([[(d[1], d[1]), (d[1], d[2]), (d[2], d[2]), (d[2], d[1]), (d[1], d[1])]]), obcs=obcs_from_landscape(objl)
         KAgentMDP(name=name, start=start,
-                  dimensions=d,
-                  boxworld=GI.Polygon([[(d[1], d[1]), (d[1], d[2]), (d[2], d[2]), (d[2], d[1]), (d[1], d[1])]]),
-                  obj=obj,
+                  dimensions=d, boxworld = boxworld, obcs=obcs,
+                  world=GI.Polygon([GI.getexterior(boxworld), map(o->GI.getexterior(o), obcs)...]),
+                  obj=obj_from_landscape(objl; digits=digits),
                   s=1., w=0.05, menv=menv, v=0.05, γ=0.95,
-                  digits=3)
+                  digits=digits)
     end
 end
 
@@ -120,37 +102,77 @@ action_heading_assoc_kagent = Dict([(:n,  normalize([ 0,  1])),
                                     (:nw, normalize([-1,  1])),
                                     (:c,  [0., 0.])])
 
-function stay_in_boundary(xs::Matrix, xp::Matrix, pgon; new_partition=nothing, debug::Bool=false, tol=1e-5)
-    if GO.distance(GI.Point(Tuple(xp)), pgon) > tol
-        println("Offending point: ", xp, "| Stated distance: ", GO.distance(GI.Point(Tuple(xp)), pgon), " | Polygon: ", pgon)
-        let boundary = GI.getexterior(pgon), movement = GI.LineString([GI.Point(Tuple(xs)), GI.Point(Tuple(xp))]), new_boundary = [], found_intersect = false
-            st_v=copy(xs)
-            part = isnothing(new_partition) ? partition(boundary.geom, 2, 1) : new_partition
-            for line in part
-                linestring = GI.LineString([GI.Point(line[1]), GI.Point(line[2])])
+function collision_check(xs::Matrix, xp::Matrix, pgon; trapped=false, debug::Bool=true, tol=1e-5, iter_count=1)
+    if iter_count > 10
+        return xp
+    else
+        if debug; println("Iter no.: ", iter_count); end
+    end
+    # is it outside the boundaries of the traversible world?
+    if debug
+        dist = GO.distance(GI.Point(Tuple(xp)), pgon)
+        println("Point under question: ", xp, "| Stated distance: ", dist, " | Polygon: ", pgon);
+    end
+    # or did it happen to cut through a (thin) obstacle?
+    movement = GI.LineString([GI.Point(Tuple(xs)), GI.Point(Tuple(xp))])
+    boundary_intersect = GO.intersection(movement, GI.getexterior(pgon); target=GI.PointTrait())
+    if debug; println("Boundary crossings: ", boundary_intersect); end
+    if isempty(boundary_intersect)
+        adj_movement = movement
+        isoutside = false
+    else
+        # draw line to an end point just near the boundary crossing
+        adj_end = xs .+ ((reshape(collect(boundary_intersect[end]), (1,:)) - xs) .* (1-5*tol))
+        adj_movement = GI.LineString([GI.Point(Tuple(xs)), GI.Point(Tuple(adj_end))])
+        isoutside = true
+    end
+    through_hole = filter(!isempty, map(GI.gethole(pgon)) do hole
+        GO.intersection(adj_movement, hole; target=GI.PointTrait())
+    end)
+    println("Through holes are: ", through_hole)
+
+    if isoutside || !isempty(through_hole)
+        boundaries = map(geo->partition(geo.geom, 2, 1), pgon.geom) |> Iterators.flatten
+        let intersects = []
+            for line in boundaries
+                linestring = GI.LineString(GI.Point.(collect(line)))
                 intersect = GO.intersection(movement, linestring; target=GI.PointTrait())
-                println("Partition: ", line,"| Line: ", linestring, "| Intersections: ", intersect)
-                if !(isempty(intersect) || found_intersect)
-                    found_intersect = true
-                    st_v = reshape(collect(intersect[end]), (1,:))
-                    end_v = reshape(collect(GI.getcoord(GI.getpoint(linestring)[2])), (1,:))
-                    inter_h = normalize(end_v - st_v)
-                    mvt_v = xp - st_v
-                    xp = (mvt_v ⋅ inter_h) .* inter_h .+ st_v
-                    if debug
-                        inter_v = end_v - st_v
-                        println("Found the intersection: ", st_v)
-                        println("Vector of movement: ", mvt_v)
-                        println("Vector of intercepted side: ", inter_v)
-                        println("The rest of the movement then is: ", (mvt_v ⋅ inter_h) .* inter_h)
-                        println("Final endpoint is: ", (mvt_v ⋅ inter_h) .* inter_h .+ st_v)
-                    end
-                else
-                    push!(new_boundary, line)
+                if !isempty(intersect)
+                    interpoint = reshape(collect(intersect[end]), (1, :))
+                    if debug; println("Partition: ", line,"| Line: ", linestring, "| Intersections: ", intersect); end
+                    push!(intersects, Any[copy(reshape(collect(line[1]), (1,:))),
+                                          copy(reshape(collect(line[2]), (1,:))),
+                                          copy(interpoint), norm(xs - interpoint)])
                 end
             end
-            return stay_in_boundary(st_v, xp, pgon; new_partition=new_boundary, debug=debug)
+            for line_data in sort(intersects, by=s->s[4])
+                v_end_1, v_end_2, interp, d_to_interp = line_data
+                # st_v = line_data[2]
+                # end_v = reshape(collect(line[2]), (1,:))
+                inter_v = v_end_1 - interp
+                inter_v = iszero(norm(inter_v)) ? v_end_2 - interp : inter_v
+                inter_h = normalize(inter_v)
+                mvt_v = xp - interp
+                shifted_v = (mvt_v ⋅ inter_h) .* inter_h
+                if debug
+                    println("Found the intersection: ", interp)
+                    println("Vector of movement: ", mvt_v)
+                    println("Vector of intercepted side: ", inter_v)
+                    println("The rest of the movement then is: ", shifted_v)
+                end
+                if norm(mvt_v - shifted_v) > tol
+                    xp = shifted_v .+ interp
+                    if debug; println("Final endpoint is: ", xp); end
+                    stuck = norm(interp - xs) < tol # check if we've moved or just rotated vectors
+                    if stuck && trapped # corner check
+                        return xs # turns out we've arrived at a (non-right) corner
+                    else
+                        return collision_check(interp, xp, pgon; trapped = stuck, debug=debug, iter_count=iter_count+1)
+                    end
+                end
+            end
         end
+        return xp #idk how you got here but just toss it back I guess clip through everything like a boss
     else
         return xp
     end
@@ -159,7 +181,7 @@ end
 function POMDPs.gen(mdp::KAgentMDP, s::KAgentState, a::Symbol, rng)
     real_a = reshape(round.(rand(MvNormal(action_heading_assoc_kagent[a], mdp.w)), digits=mdp.digits), (1,:)) # real action factoring in noise
     xp = @. s.x + real_a * mdp.s
-    xp = stay_in_boundary(s.x, xp, mdp.boxworld)
+    xp = collision_check(s.x, xp, mdp.world)
     # isoutside = GO.distance(GI.Point(Tuple(xp)), mdp.boxworld) > 0
     # world_intersect = GO.intersection(GI.LineString([GI.Point(Tuple(s.x)), GI.Point(Tuple(xp))]), GI.getexterior(mdp.boxworld); target=GI.PointTrait())
     # xp = (!isempty(world_intersect) && isoutside) ? reshape(collect(world_intersect[end]), (1,:)) : xp

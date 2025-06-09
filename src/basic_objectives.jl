@@ -1,36 +1,8 @@
 using LinearAlgebra: norm
 using Match
 
-export ObjectiveLandscape, line_to_target_obj, time_till_completion_obj, safety_obj, combined_obj, obj_from_landscape
-
-"""A struct containing a vector of objectives. With special format.
-
-Each element of the vector is a tuple:
-* The first element of the tuple is a symbol indicating objective type
-* The second element of the tuple contains the details of the objective itself
-
-An example is:
-```
-(:goal, Dict(:target=>[9.5 9.5], :strength=>100., :influence=>10., :size=>0.5))
-```
-
-The objective types can be:
-* Goal-attraction objective: :goal
-  * The contents should be a dictionary
-* Goal-avoidance objective: :obc
-  * The contents should be a vector of all obstacles. Look at obstacle use for more information.
-* Time horizon objective: :horz
-  * The content is a single float to indicate horizon urgency (relative to strongest reward).
-"""
-struct ObjectiveLandscape
-    objectives::Vector
-
-    ObjectiveLandscape(objectives::Vector) = new(objectives)
-end
-
-"""Keyword-based constructor.
-"""
-ObjectiveLandscape(; objectives) = ObjectiveLandscape(objectives)
+export line_to_target_obj, time_till_completion_obj, safety_obj, combined_obj
+export obj_from_landscape, obcs_from_landscape
 
 """Rewards based on closeness to goal.
 """
@@ -84,4 +56,16 @@ function obj_from_landscape(objs::ObjectiveLandscape; digits=2)
         end
     end
     return s->combined_obj(s, fs; digits=digits)
+end
+
+function obcs_from_landscape(objs::ObjectiveLandscape)
+    obcs = map(objs.objectives) do obj
+        @match obj[1] begin
+            :obc => obj[2]
+            _    => nothing
+        end
+    end
+    map(filter(!isnothing, obcs)[1]) do obc
+        GI.Polygon([obc[:poly]])
+    end
 end
