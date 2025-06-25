@@ -13,10 +13,11 @@ struct KAgentMDP <: POMDPs.MDP{KAgentState, Symbol}
     start::Matrix # Grid location of starting pose of agent
     dimensions::Tuple # Dimensions of 2D grid-world
     boxworld::GI.Polygon # 2D world constructed from dimensions
-    obcs::Vector # 2D world obstacles (holes in the traversable region)
+    objl::AgentObjectiveLandscape # Agent objective landscape
+    obcs::Vector # 2D world obstacles (holes in the traversable region) - separated from landscape for convenience
+    obj::Function # objective function: must return two values, [Immediate reward for reaching state (KAgentState), Boolean True if Objective Accomplished]
     world::GI.Polygon # Effectively traversable 2D world (built from boxworld and obcs)
     width::Float64
-    obj::Function # objective function: must return two values, [Immediate reward for reaching state (KAgentState), Boolean True if Objective Accomplished]
     s::Float64 # movement speed
     w::Float64 # movement noise (in the angle, i.e. action, not in movement speed)
     menv::MuEnv # Observable environment process of the world
@@ -26,25 +27,25 @@ struct KAgentMDP <: POMDPs.MDP{KAgentState, Symbol}
 
     KAgentMDP(name::String, start::Matrix,
               dimensions::Tuple, boxworld::GI.Polygon,
-              obcs::Vector, world::GI.Polygon, width::Float64,
-              obj::Function,
+              objl::AgentObjectiveLandscape, obcs::Vector, obj::Function,
+              world::GI.Polygon, width::Float64,
               s::Float64, w::Float64,
               menv::MuEnv, v::Float64,
-              γ::Float64, digits::Integer) = new(name, start, dimensions, boxworld, obcs, world, width, obj, s, w, menv, v, γ, digits)
+              γ::Float64, digits::Integer) = new(name, start, dimensions, boxworld, objl, obcs, obj, world, width, s, w, menv, v, γ, digits)
 end
 
 function KAgentMDP(;
     name::String, start::Matrix,
     dimensions::Tuple, boxworld::GI.Polygon,
-    obcs::Vector, world::GI.Polygon, width::Float64,
-    obj::Function,
+    objl::AgentObjectiveLandscape, obcs::Vector, obj::Function,
+    world::GI.Polygon, width::Float64,
     s::Float64,
     w::Float64,
     menv::MuEnv,
     v::Float64,
     γ::Float64,
     digits::Integer)
-    return KAgentMDP(name, start, dimensions, boxworld, obcs, world, width, obj, s, w, menv, v, γ, digits)
+    return KAgentMDP(name, start, dimensions, boxworld, objl, obcs, obj, world, width, s, w, menv, v, γ, digits)
 end
 
 function init_standard_KAgentMDP(;
@@ -54,10 +55,10 @@ function init_standard_KAgentMDP(;
     mdp_horizon_discount::Float64=0.95)
     let d=dimensions, boxworld=GI.Polygon([[(d[1], d[1]), (d[1], d[2]), (d[2], d[2]), (d[2], d[1]), (d[1], d[1])]]), obcs=obcs_from_landscape(objl)
         KAgentMDP(name=name, start=start,
-                  dimensions=d, boxworld = boxworld, obcs=obcs,
+                  dimensions=d, boxworld = boxworld, objl=objl, obcs=obcs,
+                  obj=obj_from_landscape(objl; digits=digits),
                   world=GI.Polygon([GI.getexterior(boxworld), map(o->GI.getexterior(o), obcs)...]),
                   width=agent_width,
-                  obj=obj_from_landscape(objl; digits=digits),
                   s=agent_speed, w=ag_mvt_noise, menv=menv, v=obs_noise, γ=mdp_horizon_discount,
                   digits=digits)
     end
