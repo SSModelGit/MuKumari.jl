@@ -1,0 +1,11 @@
+[deps]
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+Crux = "e51cc422-768a-4345-bb8e-2246287ae729"
+JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+MCTS = "e12ccd36-dcad-5f33-8774-9175229e7b33"
+MuKumari = "28f59e21-8c37-415f-8237-13dbde849877"
+POMDPLinter = "f3bd98c0-eb40-45e2-9eb1-f2763262d755"
+POMDPTools = "7588e00f-9cae-40de-98dc-e0c70c48cdd7"
+POMDPs = "a93abf59-7444-517b-a68a-c42f96afdd7d"
+cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
