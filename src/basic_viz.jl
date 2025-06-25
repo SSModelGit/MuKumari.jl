@@ -13,7 +13,7 @@ function viz_obcs(ax, obcs::Vector)
     end
 end
 
-function viz_obj_landscape(ax, objs::ObjectiveLandscape)
+function viz_obj_landscape(ax, objs::AgentObjectiveLandscape)
     for obj in objs.objectives
         @match obj[1] begin
             :goal => poly!(ax, Circle(Point2f(Tuple(obj[2][:target])), obj[2][:size]), strokecolor=:black, strokewidth=0.0pt, color=:green)
@@ -23,7 +23,7 @@ function viz_obj_landscape(ax, objs::ObjectiveLandscape)
     end
 end
 
-function viz_agent_worldview(mdp::KAgentMDP, objs::ObjectiveLandscape)
+function viz_agent_worldview(mdp::KAgentMDP, objs::AgentObjectiveLandscape)
     f = Figure(; figure_padding=(2.0pt, 2.0pt, 2.0pt, 2.0pt))
     ax = Axis(f[1,1], spinewidth=2.0pt, aspect=DataAspect())
 
@@ -46,14 +46,14 @@ function viz_agent_status(f, ax, mdp::KAgentMDP, s::KAgentState, a::Symbol; show
     if show_obj; viz_agent_reward_landscape(f, ax, mdp, s); end
 end
 
-function viz_system_single_timestep(mdp::KAgentMDP, s::KAgentState, a::Symbol, objs::ObjectiveLandscape)
+function viz_system_single_timestep(mdp::KAgentMDP, s::KAgentState, a::Symbol, objs::AbstractObjectiveLandscape)
     f, ax = viz_agent_worldview(mdp, objs)
     viz_agent_reward_landscape(f, ax, mdp, s)
     viz_agent_status(f, ax, mdp, s, a; show_obj=false)
     f
 end
 
-function viz_system_sim(mdp::KAgentMDP, objs::ObjectiveLandscape, sim_trace::Vector)
+function viz_system_sim(mdp::KAgentMDP, objs::AbstractObjectiveLandscape, sim_trace::Vector)
     f, ax = viz_agent_worldview(mdp, objs)
     viz_agent_reward_landscape(f, ax, mdp, sim_trace[end][1])
 

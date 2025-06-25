@@ -16,9 +16,9 @@ goal = Dict(:target=>[9.5 9.5], :strength=>100., :influence=>10., :size=>0.5)
 
 urgency = 1.5
 
-obj_landscape = ObjectiveLandscape(; objectives=[(:goal, goal), (:obc, obcs), (:horz, urgency)])
+obj_landscape = AgentObjectiveLandscape(; objectives=[(:goal, goal), (:obc, obcs), (:horz, urgency)])
 
-# obj_landscape = ObjectiveLandscape(; objectives=[(:goal, goal), (:horz, urgency)])
+# obj_landscape = AgentObjectiveLandscape(; objectives=[(:goal, goal), (:horz, urgency)])
 
 menv = let μfs = [(:sin, x->sin(x[1]) + cos(x[2])), (:exp, x->100*exp(-norm(x-[8 8.])^2 / 1.)), (:lin, x->x[1]^2 + x[2])], μs = [:sin, :exp, :lin];
     MuEnv(3, μs, Dict(μfs));

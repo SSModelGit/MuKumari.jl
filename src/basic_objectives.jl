@@ -1,5 +1,4 @@
 using LinearAlgebra: norm
-using Match
 
 export line_to_target_obj, time_till_completion_obj, safety_obj, combined_obj
 export obj_from_landscape, obcs_from_landscape
@@ -47,7 +46,7 @@ function combined_obj(s::KAgentState, fs::Vector; digits=2)
     end
 end
 
-function obj_from_landscape(objs::ObjectiveLandscape; digits=2)
+function obj_from_landscape(objs::AgentObjectiveLandscape; digits=2)
     fs = map(objs.objectives) do obj
         @match obj[1] begin
             :goal => s->line_to_target_obj(s, obj[2])
@@ -58,7 +57,7 @@ function obj_from_landscape(objs::ObjectiveLandscape; digits=2)
     return s->combined_obj(s, fs; digits=digits)
 end
 
-function obcs_from_landscape(objs::ObjectiveLandscape)
+function obcs_from_landscape(objs::AgentObjectiveLandscape)
     obcs = map(objs.objectives) do obj
         @match obj[1] begin
             :obc => obj[2]

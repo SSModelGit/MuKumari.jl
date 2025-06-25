@@ -6,7 +6,7 @@ using IterTools: partition
 using POMDPTools, MCTS
 
 export blindstart_KAgentState, pseudo_agent_placement,KAgentMDP, init_standard_KAgentMDP
-export KWorld, create_empty_kworld, add_agent_to_world, get_num_agents
+export KWorld, create_kworld, add_agent_to_world, get_num_agents
 
 struct KAgentMDP <: POMDPs.MDP{KAgentState, Symbol}
     name::String
@@ -49,14 +49,16 @@ end
 
 function init_standard_KAgentMDP(;
     name::String, start::Matrix,
-    dimensions::Tuple, objl::ObjectiveLandscape, menv::MuEnv, digits::Integer=3, width::Float64=0.1)
+    dimensions::Tuple, objl::AgentObjectiveLandscape, menv::MuEnv,
+    digits::Integer=3, agent_width::Float64=0.1, agent_speed::Float64=1., ag_mvt_noise::Float64=0.05, obs_noise::Float64=0.05,
+    mdp_horizon_discount::Float64=0.95)
     let d=dimensions, boxworld=GI.Polygon([[(d[1], d[1]), (d[1], d[2]), (d[2], d[2]), (d[2], d[1]), (d[1], d[1])]]), obcs=obcs_from_landscape(objl)
         KAgentMDP(name=name, start=start,
                   dimensions=d, boxworld = boxworld, obcs=obcs,
                   world=GI.Polygon([GI.getexterior(boxworld), map(o->GI.getexterior(o), obcs)...]),
-                  width=width,
+                  width=agent_width,
                   obj=obj_from_landscape(objl; digits=digits),
-                  s=1., w=0.05, menv=menv, v=0.05, γ=0.95,
+                  s=agent_speed, w=ag_mvt_noise, menv=menv, v=obs_noise, γ=mdp_horizon_discount,
                   digits=digits)
     end
 end
@@ -94,6 +96,7 @@ Currently assumes constant motion speed.
 """
 POMDPs.actions(mdp::KAgentMDP) = [:n, :ne, :e, :se, :s, :sw, :w, :nw, :c]
 
+# Constant association between symbols (for ease of use) and movement vectors (for computation)
 action_heading_assoc_kagent = Dict([(:n,  normalize([ 0,  1])),
                                     (:ne, normalize([ 1,  1])),
                                     (:e,  normalize([ 1,  0])),
@@ -104,7 +107,10 @@ action_heading_assoc_kagent = Dict([(:n,  normalize([ 0,  1])),
                                     (:nw, normalize([-1,  1])),
                                     (:c,  [0., 0.])])
 
+"""Collision checking function. Stops the agent at the first possible collision.
 
+Note that the agent will stop  at an agent's width away from the 
+"""
 function collision_check(xs::Matrix, xp::Matrix, pgon, width; debug::Bool=true, digits=3)
     if debug
         dist = GO.distance(GI.Point(Tuple(xp)), pgon)
@@ -145,121 +151,132 @@ function collision_check(xs::Matrix, xp::Matrix, pgon, width; debug::Bool=true, 
     return round.(xp; digits=digits)
 end
 
-# function collision_check(xs::Matrix, xp::Matrix, pgon; trapped=false, debug::Bool=true, tol=1e-5, iter_count=1)
-#     if iter_count > 10
-#         return xp
-#     else
-#         if debug; println("Iter no.: ", iter_count); end
-#     end
-#     # is it outside the boundaries of the traversible world?
-#     if debug
-#         dist = GO.distance(GI.Point(Tuple(xp)), pgon)
-#         println("Point under question: ", xp, "| Stated distance: ", dist, " | Polygon: ", pgon);
-#     end
-#     # or did it happen to cut through a (thin) obstacle?
-#     movement = GI.LineString([GI.Point(Tuple(xs)), GI.Point(Tuple(xp))])
-#     boundary_intersect = GO.intersection(movement, GI.getexterior(pgon); target=GI.PointTrait())
-#     if debug; println("Boundary crossings: ", boundary_intersect); end
-#     if isempty(boundary_intersect)
-#         adj_movement = movement
-#         isoutside = false
-#     else
-#         # draw line to an end point just near the boundary crossing
-#         adj_end = xs .+ ((reshape(collect(boundary_intersect[end]), (1,:)) - xs) .* (1-5*tol))
-#         adj_movement = GI.LineString([GI.Point(Tuple(xs)), GI.Point(Tuple(adj_end))])
-#         isoutside = true
-#     end
-#     through_hole = filter(!isempty, map(GI.gethole(pgon)) do hole
-#         GO.intersection(adj_movement, hole; target=GI.PointTrait())
-#     end)
-#     println("Through holes are: ", through_hole)
-
-#     if isoutside || !isempty(through_hole)
-#         boundaries = map(geo->partition(geo.geom, 2, 1), pgon.geom) |> Iterators.flatten
-#         let intersects = []
-#             for line in boundaries
-#                 linestring = GI.LineString(GI.Point.(collect(line)))
-#                 intersect = GO.intersection(movement, linestring; target=GI.PointTrait())
-#                 if !isempty(intersect)
-#                     interpoint = reshape(collect(intersect[end]), (1, :))
-#                     if debug; println("Partition: ", line,"| Line: ", linestring, "| Intersections: ", intersect); end
-#                     push!(intersects, Any[copy(reshape(collect(line[1]), (1,:))),
-#                                           copy(reshape(collect(line[2]), (1,:))),
-#                                           copy(interpoint), norm(xs - interpoint)])
-#                 end
-#             end
-#             for line_data in sort(intersects, by=s->s[4])
-#                 v_end_1, v_end_2, interp, d_to_interp = line_data
-#                 # st_v = line_data[2]
-#                 # end_v = reshape(collect(line[2]), (1,:))
-#                 inter_v = v_end_1 - interp
-#                 inter_v = iszero(norm(inter_v)) ? v_end_2 - interp : inter_v
-#                 inter_h = normalize(inter_v)
-#                 mvt_v = xp - interp
-#                 shifted_v = (mvt_v ⋅ inter_h) .* inter_h
-#                 if debug
-#                     println("Found the intersection: ", interp)
-#                     println("Vector of movement: ", mvt_v)
-#                     println("Vector of intercepted side: ", inter_v)
-#                     println("The rest of the movement then is: ", shifted_v)
-#                 end
-#                 if norm(mvt_v - shifted_v) > tol
-#                     xp = shifted_v .+ interp
-#                     if debug; println("Final endpoint is: ", xp); end
-#                     stuck = norm(interp - xs) < tol # check if we've moved or just rotated vectors
-#                     if stuck && trapped # corner check
-#                         return xs # turns out we've arrived at a (non-right) corner
-#                     else
-#                         return collision_check(interp, xp, pgon; trapped = stuck, debug=debug, iter_count=iter_count+1)
-#                     end
-#                 end
-#             end
-#         end
-#         return xp #idk how you got here but just toss it back I guess clip through everything like a boss
-#     else
-#         return xp
-#     end
-# end
 
 function POMDPs.gen(mdp::KAgentMDP, s::KAgentState, a::Symbol, rng)
+    # add noise to the action taken (both in direction and speed)
     real_a = reshape(round.(rand(MvNormal(action_heading_assoc_kagent[a], mdp.w)), digits=mdp.digits), (1,:)) # real action factoring in noise
+    # propagate next location
     xp = @. s.x + real_a * mdp.s
+    # adjust for any collision
     xp = collision_check(s.x, xp, mdp.world, mdp.width; debug=false, digits=mdp.digits)
-    # isoutside = GO.distance(GI.Point(Tuple(xp)), mdp.boxworld) > 0
-    # world_intersect = GO.intersection(GI.LineString([GI.Point(Tuple(s.x)), GI.Point(Tuple(xp))]), GI.getexterior(mdp.boxworld); target=GI.PointTrait())
-    # xp = (!isempty(world_intersect) && isoutside) ? reshape(collect(world_intersect[end]), (1,:)) : xp
-    # if GO.distance(GI.Point(Tuple(xp)), mdp.boxworld) > 0
-    #     xp = copy(s.x)
-    # end
+    # make an observation vector for next location
     zp = push!(copy(s.z), predict_env(mdp.menv, xp))
+    # update the next timestep's history
     hist_p = push!(copy(s.hist), s.x)
+    # create state for next time step
     sp = KAgentState(xp, zp, hist_p)
 
     # POMDP observation refers to state observation. Noise will occur in the position of the vehicle
     # for simplicity doubling noise in observation of position with noise of movement
     o_x = xp .+ reshape(round.(rand(MvNormal([0.0, 0.0], mdp.w)), digits=mdp.digits), (1,:))
-    
+
+    # compute reward for reaching the next state (first output of the MDP's defined objective function)
     r = mdp.obj(sp)[1]
+
+    # return required items for the POMDPs.gen function (next state, observation, reward)
     return (sp = sp, o = o_x, r = r)
 end
 
 struct KWorld
-    dimensions::Vector # Dimensions of 2D-world
-    inhabitants::Dict{Symbol, KAgentMDP} # Dictionary of agents (agent POMDPs) operating in this world
-    menv::MuEnv # Environment associated with this world
+    solver::Union{MCTSSolver} # Untyped to allow for a broad array of possible types
+    dimensions::Tuple # Dimensions of 2D-world
+    inhabitants::Dict{String, KAgentMDP} # Dictionary of agents (agent POMDPs) operating in this world
+    menv::MuEnv # Global environment of the world
+    glob_landscape::GlobalObjectiveLandscape # Global objective landscape of the world
 
-    KWorld(dimensions::Vector, inhabitants::Dict, menv::MuEnv) = new(dimensions, inhabitants, menv)
+    KWorld(solver, dimensions::Tuple, inhabitants::Dict, menv::MuEnv, glob_landscape::GlobalObjectiveLandscape) = new(solver,
+                                                                                                                      dimensions,
+                                                                                                                      inhabitants,
+                                                                                                                      menv, glob_landscape)
 end
 
-"""Keyword constructor for a new world.
+"""
+$(SIGNATURES)
+
+Keyword constructor for a new world.
 
 Defaults to no inhabitants (i.e., an empty dictionary.) Use `add_agent_to_world` to populate one-by-one.
 """
-create_kworld(;dims::Vector, menv::MuEnv, inhabitants::Dict=Dict{String, KAgentMDP}()) = KWorld(dims, inhabitants, menv)
+create_kworld(;
+              solver::Union{MCTSSolver}, dims::Tuple,
+              menv::MuEnv, gobj::GlobalObjectiveLandscape,
+              inhabitants::Dict=Dict{String, KAgentMDP}()) = KWorld(solver, dims, inhabitants, menv, gobj)
 
-"""Add a single agent to the world.
+"""
+$(SIGNATURES)
+
+Base function to add a single agent to the world.
+
+Separated in case there exists an already-defined agent MDP that needs to be added.
 """
 add_agent_to_world(kworld::KWorld, kagent::KAgentMDP) = kworld.inhabitants[kagent.name] = kagent
+
+"""
+$(SIGNATURES)
+
+Proper keyword-based constructor to create and add a single agent to the world.
+
+Explicitly calls out all the arguments for the agent.
+Lacks safety checks.
+"""
+function add_agent_to_world(;
+                            kworld::KWorld,
+                            name::String, start_pos::Matrix,
+                            ag_flist::Vector, ag_sensor_list::Vector,
+                            dimensions::Union{Tuple, Nothing}=nothing, digits::Integer=3, mdp_horizon_discount::Float64=0.95,
+                            agent_width::Float64=0.1, agent_speed::Float64=1., ag_mvt_noise::Float64=0.05,
+                            obs_noise::Float64=0.05)
+    if isnothing(dimensions)
+        dimensions = kworld.dimensions
+    end
+    ag_menv = tangle_agent_env(kworld.menv, ag_sensor_list)
+    ag_landscape = tangle_agent_landscape(kworld.glob_landscape, ag_flist)
+    agent_mdp = init_standard_KAgentMDP(name=name, start=start_pos,
+                                        dimensions=dimensions, objl=ag_landscape, menv=ag_menv,
+                                        digits=digits, mdp_horizon_discount=mdp_horizon_discount,
+                                        agent_width=agent_width, agent_speed=agent_speed, ag_mvt_noise=ag_mvt_noise,
+                                        obs_noise=obs_noise)
+    add_agent_to_world(kworld, agent_mdp)
+end
+
+"""
+$(SIGNATURES)
+
+Dictionary-based constructor for creating and adding an agent to the world.
+
+Necessarily not only keywords as multiple dispatch does not operate on keyword args.
+"""
+function add_agent_to_world(kworld::KWorld, agent_params::Dict; add_safely::Bool=true)
+    if add_safely
+        param_list = keys(agent_params)
+        print("Checking all required components exist...")
+        @assert :name ∈ param_list "No :name specified!"
+        @assert :start ∈ param_list "No :start position specified!"
+        @assert :flist ∈ param_list "No feature list (:flist) specified!"
+        @assert :elist ∈ param_list "No observable environment characteristics (:elist) specified!"
+        print(" ok.\nChecking parameter definitions obey global world definition...")
+        @assert agent_params[:flist] ⊆ kworld.glob_landscape.feature_list "Agent feature list exceeds globally captured features!"
+        @assert agent_params[:elist] ⊆ kworld.menv.μ_order "Agent can observe environment characteristics not captured in the global environment!"
+        if :dims ∈ param_list
+            @assert agent_params[:dims][1] ≥ kworld.dimensions[1] "Agent is operating beyond the lower global bounds!"
+            @assert agent_params[:dims][2] ≤ kworld.dimensions[2] "Agent is operating beyond the upper global bounds!"
+        end
+        println(" ok.")
+    end
+    dims=get(agent_params, :dims, nothing)
+    digits=get(agent_params, :digits, 3)
+    mdp_horizon_discount=get(agent_params, :γ, 0.95)
+    agent_width=get(agent_params, :width, 0.1)
+    agent_speed=get(agent_params, :s, 1.)
+    ag_mvt_noise=get(agent_params, :w, 0.05)
+    obs_noise=get(agent_params, :v, 0.05)
+    add_agent_to_world(;
+                       kworld=kworld, name=agent_params[:name], start_pos=agent_params[:start],
+                       ag_flist=agent_params[:flist], ag_sensor_list=agent_params[:elist],
+                       dimensions=dims, digits=digits, mdp_horizon_discount=mdp_horizon_discount,
+                       agent_width=agent_width, agent_speed=agent_speed, ag_mvt_noise=ag_mvt_noise,
+                       obs_noise=obs_noise)
+end
 
 """Populate world with a list of agents at once.
 """
