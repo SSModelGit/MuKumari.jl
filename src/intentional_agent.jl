@@ -87,6 +87,8 @@ POMDPs.isterminal(mdp::KAgentMDP, s::KAgentState) = mdp.obj(s)[2]
 
 POMDPs.initialstate(mdp::KAgentMDP) = Deterministic(blindstart_KAgentState(mdp, mdp.start))
 
+POMDPs.initialobs(mdp::KAgentMDP, s) = s -> Deterministic(state(s))
+
 POMDPs.discount(mdp::KAgentMDP) = mdp.γ
 
 """Action space of the KAgentMDP.

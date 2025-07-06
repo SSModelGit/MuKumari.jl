@@ -64,6 +64,8 @@ function Base.show(io::IO, s::KAgentState)
     println(io, "\tAgent Location History: $(s.hist)")
 end
 
+state(s::KAgentState) = s.x
+
 abstract type AbstractObjectiveLandscape end
 
 """A struct containing a vector of objectives. With special format.
