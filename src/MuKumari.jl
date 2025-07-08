@@ -2,6 +2,7 @@ module MuKumari
 
 using Reexport
 using DocStringExtensions
+using Parameters: @with_kw
 
 using Match
 import GeoInterface as GI
@@ -65,6 +66,8 @@ function Base.show(io::IO, s::KAgentState)
 end
 
 state(s::KAgentState) = s.x
+z(s::KAgentState) = s.z[end]
+t(s::KAgentState) = length(s.hist)
 
 abstract type AbstractObjectiveLandscape end
 

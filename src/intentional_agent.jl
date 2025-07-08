@@ -8,7 +8,7 @@ using POMDPTools, MCTS
 export blindstart_KAgentState, pseudo_agent_placement,KAgentMDP, init_standard_KAgentMDP
 export KWorld, create_kworld, add_agent_to_world, get_num_agents
 
-struct KAgentMDP <: POMDPs.MDP{KAgentState, Symbol}
+struct KAgentMDP <: POMDPs.POMDP{KAgentState, Vector{Float64}, Symbol}
     name::String
     start::Matrix # Grid location of starting pose of agent
     dimensions::Tuple # Dimensions of 2D grid-world
@@ -87,7 +87,7 @@ POMDPs.isterminal(mdp::KAgentMDP, s::KAgentState) = mdp.obj(s)[2]
 
 POMDPs.initialstate(mdp::KAgentMDP) = Deterministic(blindstart_KAgentState(mdp, mdp.start))
 
-POMDPs.initialobs(mdp::KAgentMDP, s) = s -> Deterministic(state(s))
+POMDPs.initialobs(mdp::KAgentMDP, s) = Deterministic([state(s)..., z(s)..., t(s)])
 
 POMDPs.discount(mdp::KAgentMDP) = mdp.γ
 
@@ -154,10 +154,9 @@ function collision_check(xs::Matrix, xp::Matrix, pgon, width; debug::Bool=true, 
     return round.(xp; digits=digits)
 end
 
-
 function POMDPs.gen(mdp::KAgentMDP, s::KAgentState, a::Symbol, rng)
     # add noise to the action taken (both in direction and speed)
-    real_a = reshape(round.(rand(MvNormal(action_heading_assoc_kagent[a], mdp.w)), digits=mdp.digits), (1,:)) # real action factoring in noise
+    real_a = reshape(round.(rand(rng, MvNormal(action_heading_assoc_kagent[a], mdp.w)), digits=mdp.digits), (1,:)) # real action factoring in noise
     # propagate next location
     xp = @. s.x + real_a * mdp.s
     # adjust for any collision
@@ -171,13 +170,52 @@ function POMDPs.gen(mdp::KAgentMDP, s::KAgentState, a::Symbol, rng)
 
     # POMDP observation refers to state observation. Noise will occur in the position of the vehicle
     # for simplicity doubling noise in observation of position with noise of movement
-    o_x = xp .+ reshape(round.(rand(MvNormal([0.0, 0.0], mdp.w)), digits=mdp.digits), (1,:))
+    o_x = xp .+ reshape(round.(rand(rng, MvNormal([0.0, 0.0], mdp.w)), digits=mdp.digits), (1,:))
+    # NEW ADDITION: trying out a vectorization of the agent state that captures all immediate information in one vector for RL-ing
+    o = [o_x..., z(sp)..., t(sp)]
 
     # compute reward for reaching the next state (first output of the MDP's defined objective function)
     r = mdp.obj(sp)[1]
 
     # return required items for the POMDPs.gen function (next state, observation, reward)
-    return (sp = sp, o = o_x, r = r)
+    return (sp = sp, o = o, r = r)
+end
+
+"""
+$(SIGNATURES)
+
+Belief-state updater for the KAgentPOMDP.
+
+It essentially reconstructs a new deterministic state out of the observation vector.
+
+#TODO: Make this non-deterministic (i.e., observation noise should enter here.)
+"""
+@with_kw struct KAgentBeliefUpdater <: POMDPs.Updater
+    state_dims = 2
+    env_dims = 3
+end
+
+"""
+$(SIGNATURES)
+
+Defines the initial belief for the POMDP.
+
+For the most part, this should be used like
+```
+POMDPs.initialize_belief(u, initialstate(pomdp))
+```
+
+This will result in the same initial belief distribution as the actual initial state distribution.
+"""
+POMDPs.initialize_belief(u::KAgentBeliefUpdater, d::Any) = d
+
+function POMDPs.update(bu::KAgentBeliefUpdater, old_b, action, obs)
+    old_s = rand(old_b)
+    xn = reshape(obs[1:bu.state_dims], (1, bu.state_dims))
+    zn = obs[bu.state_dims+1:bu.state_dims+bu.env_dims]
+    hist = push!(copy(old_s.hist), old_s.x)
+    z = push!(copy(old_s.z), zn)
+    Deterministic(KAgentState(xn, z, hist))
 end
 
 struct KWorld
