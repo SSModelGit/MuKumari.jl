@@ -6,9 +6,10 @@ using IterTools: partition
 using POMDPTools, MCTS
 
 export blindstart_KAgentState, pseudo_agent_placement,KAgentMDP, init_standard_KAgentMDP
+export KAgentBeliefUpdater
 export KWorld, create_kworld, add_agent_to_world, get_num_agents
 
-struct KAgentMDP <: POMDPs.POMDP{KAgentState, Vector{Float64}, Symbol}
+struct KAgentMDP <: POMDPs.POMDP{KAgentState, Symbol, Vector{Float64}}
     name::String
     start::Matrix # Grid location of starting pose of agent
     dimensions::Tuple # Dimensions of 2D grid-world
@@ -198,7 +199,7 @@ end
 """
 $(SIGNATURES)
 
-Defines the initial belief for the POMDP.
+Defines the initial belief for the KAgent POMDP.
 
 For the most part, this should be used like
 ```

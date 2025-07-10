@@ -3,9 +3,12 @@ using MuKumari
 using LinearAlgebra: norm, normalize
 
 using POMDPTools, MCTS, POMDPLinter
+using Plots
+using CairoMakie
+
+# Make sure to load Plots before Crux, because of some weird load order bug
 using Crux
 
-using CairoMakie
 using JLD2: save, load
 
 ## Environment Feature types:
@@ -36,7 +39,7 @@ menv = let μfs = [(:sin, x->sin(x[1]) + cos(x[2])), (:exp, x->100*exp(-norm(x-[
 end
 
 # Define world to hold all agents
-solver = MCTSSolver(n_iterations=100, depth=20, exploration_constant=1.0)
+solver = MCTSSolver(n_iterations=10000, depth=20, exploration_constant=1.0)
 dims = (0., 10.)
 kworld = create_kworld(; solver=solver, dims=dims, gobj=globj_scape, menv=menv)
 
@@ -48,20 +51,39 @@ ag1_params = Dict(:name  => "ag1",
                   :elist => ag1_envs)
 add_agent_to_world(kworld, ag1_params)
 ag1_mdp = kworld.inhabitants["ag1"]
-planner1 = solve(solver, ag1_mdp)
+ag1_bup = KAgentBeliefUpdater(state_dims=length(ag1_params[:start]), env_dims=length(ag1_envs))
+solver1 = BeliefMCTSSolver(solver, ag1_bup)
+planner1 = solve(solver1, ag1_mdp)
 
-ag2_flist = [:sub, :aer, :ag2]
-ag2_envs = [:sin, :lin]
-ag2_params = Dict(:name  => "ag2",
-                  :start => [7. 7.],
-                  :flist => ag2_flist,
-                  :elist => ag2_envs)
-add_agent_to_world(kworld, ag2_params)
-ag2_mdp = kworld.inhabitants["ag2"]
-planner2 = solve(solver, ag2_mdp)
+#= simulate(HistoryRecorder(max_steps=10), ag1_mdp, planner1, ag1_bup) =#
 
-sim_trace1 = stepthrough_sim(ag1_mdp, planner1, 15)
-sim_trace2 = stepthrough_sim(ag2_mdp, planner2, 15)
+r_sum = 0.0
+step = 0
+for (b, s, a, o, r) in stepthrough(ag1_mdp, planner1, ag1_bup, "b,s,a,o,r"; max_steps=15)
+    global step += 1
+    println("Step $step")
+    println("b = $(rand(b))")
+    @show s
+    @show a
+    @show o
+    @show r
+    global r_sum += r
+    @show r_sum
+    println()
+end
+
+# ag2_flist = [:sub, :aer, :ag2]
+# ag2_envs = [:sin, :lin]
+# ag2_params = Dict(:name  => "ag2",
+#                   :start => [7. 7.],
+#                   :flist => ag2_flist,
+#                   :elist => ag2_envs)
+# add_agent_to_world(kworld, ag2_params)
+# ag2_mdp = kworld.inhabitants["ag2"]
+# planner2 = solve(solver, ag2_mdp)
+
+# sim_trace1 = stepthrough_sim(ag1_mdp, planner1, 15)
+# sim_trace2 = stepthrough_sim(ag2_mdp, planner2, 15)
 # ag1_mdp = init_standard_KAgentMDP(; name="agent1",
 #            start=[3. 3.], dimensions=(0., 10.),
 #            objl=obj_landscape, menv=menv)

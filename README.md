@@ -4,10 +4,6 @@ This is intended as an easy-to-use playground for quickly setting up multi-agent
 
 ### TODOs:
 
-General:
-
-* Fix the Plots.jl pre-compilation issue. Probably need to add it explicitly to the manifest or load order.
-
 Steps necessary to get Crux's IQLearn working:
 
 * 1. Fix the state/observation vectorization conversion via the POMDPs `convert_s` function.
