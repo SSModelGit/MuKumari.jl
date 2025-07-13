@@ -1,12 +1,29 @@
 module MuKumari
 
+###############################################
+## Packages used across multiple files
+
+### Quality-of-life packages (used throughout all files)
 using Reexport
 using DocStringExtensions
-using Parameters: @with_kw
-
+using Parameters: @with_kw, @with_kw_noshow
 using Match
+###
+
+### Packages used to represent geometries (used in all sub-files)
 import GeoInterface as GI
 import GeometryOps as GO
+###
+
+### Below are packages used exclusively in the agent definitions (`intentional_*.jl` files)
+@reexport using POMDPs
+
+using LinearAlgebra: normalize, ⋅
+using Distributions: Normal, MvNormal
+using IterTools: partition
+using POMDPTools, MCTS
+###
+###############################################
 
 export MuEnv, predict_μ, predict_env, update_μf, tangle_agent_env
 export KAgentState, AbstractObjectiveLandscape, AgentObjectiveLandscape, GlobalObjectiveLandscape, tangle_agent_landscape
@@ -33,6 +50,13 @@ struct MuEnv
         @assert length(μf) == M
         new(M, μ_order, μf)
     end
+end
+
+muenv_characteristics_namelist(muenv::MuEnv; base="", offset="\t") = mapreduce(x->"$(base)$(offset)\":$x\"\n", *, muenv.μ_order; init="")
+
+function Base.show(io::IO, muenv::MuEnv)
+    println(io, "Number of observable characteristics: $(muenv.M)")
+    print(io, "List of characteristics:\n$(muenv_characteristics_namelist(muenv))") # new line auto-added by characteristic list function
 end
 
 predict_μ(muenv::MuEnv, μ::Symbol, X::Matrix; rounding::Integer=2) = round(muenv.μf[μ](X); digits=rounding)
@@ -147,6 +171,16 @@ function GlobalObjectiveLandscape(; goals::Vector, obstacles::Vector, horizons::
     GlobalObjectiveLandscape(goals, obstacles, horizons, collect(feature_set))
 end
 
+feature_name_list_from_vec(flist::Vector; base="\t", offset="    ") = mapreduce(x->"$(base)$(offset)\"$(x)\"\n", *, flist; init="")
+
+function Base.show(io::IO, gobj::GlobalObjectiveLandscape)
+    println(io, "Summary of the global objective landscape")
+    print(io, "\tGoal types: ($(length(gobj.goals)) total)\n$(feature_name_list_from_vec(map(x->x[1], gobj.goals)))")
+    print(io, "\tObstacle types: ($(length(gobj.obstacles)) total)\n$(feature_name_list_from_vec(map(x->x[1], gobj.obstacles)))")
+    print(io, "\tHorizon types: ($(length(gobj.horizons)) total)\n$(feature_name_list_from_vec(map(x->x[1], gobj.horizons)))")
+    print(io, "Features tracked in total: ($(length(gobj.feature_list)) total)\n$(feature_name_list_from_vec(gobj.feature_list; base=""))")
+end
+
 """Helper function for tangling features from global landscape.
 
 Pulls out the features relevant to a given agent based on the list of accessible features.
@@ -176,6 +210,9 @@ end
 
 include("basic_objectives.jl")
 include("intentional_agent.jl")
+include("intentional_agent_pomdp.jl")
+include("intentional_kworld.jl")
+include("basic_sim.jl")
 include("basic_viz.jl")
 
 end

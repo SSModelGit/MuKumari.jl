@@ -1,15 +1,6 @@
-@reexport using POMDPs
+export blindstart_KAgentState, pseudo_agent_placement, KAgentMDP, init_standard_KAgentMDP
 
-using LinearAlgebra: normalize, ⋅
-using Distributions: Normal, MvNormal
-using IterTools: partition
-using POMDPTools, MCTS
-
-export blindstart_KAgentState, pseudo_agent_placement,KAgentMDP, init_standard_KAgentMDP
-export KAgentBeliefUpdater
-export KWorld, create_kworld, add_agent_to_world, get_num_agents
-
-struct KAgentMDP <: POMDPs.POMDP{KAgentState, Symbol, Vector{Float64}}
+@with_kw_noshow struct KAgentMDP <: POMDPs.MDP{KAgentState, Symbol}
     name::String
     start::Matrix # Grid location of starting pose of agent
     dimensions::Tuple # Dimensions of 2D grid-world
@@ -25,28 +16,6 @@ struct KAgentMDP <: POMDPs.POMDP{KAgentState, Symbol, Vector{Float64}}
     v::Float64 # variance of environment observation noise process
     γ::Float64 # discount factor
     digits::Integer # rounding factor
-
-    KAgentMDP(name::String, start::Matrix,
-              dimensions::Tuple, boxworld::GI.Polygon,
-              objl::AgentObjectiveLandscape, obcs::Vector, obj::Function,
-              world::GI.Polygon, width::Float64,
-              s::Float64, w::Float64,
-              menv::MuEnv, v::Float64,
-              γ::Float64, digits::Integer) = new(name, start, dimensions, boxworld, objl, obcs, obj, world, width, s, w, menv, v, γ, digits)
-end
-
-function KAgentMDP(;
-    name::String, start::Matrix,
-    dimensions::Tuple, boxworld::GI.Polygon,
-    objl::AgentObjectiveLandscape, obcs::Vector, obj::Function,
-    world::GI.Polygon, width::Float64,
-    s::Float64,
-    w::Float64,
-    menv::MuEnv,
-    v::Float64,
-    γ::Float64,
-    digits::Integer)
-    return KAgentMDP(name, start, dimensions, boxworld, objl, obcs, obj, world, width, s, w, menv, v, γ, digits)
 end
 
 function init_standard_KAgentMDP(;
@@ -169,161 +138,9 @@ function POMDPs.gen(mdp::KAgentMDP, s::KAgentState, a::Symbol, rng)
     # create state for next time step
     sp = KAgentState(xp, zp, hist_p)
 
-    # POMDP observation refers to state observation. Noise will occur in the position of the vehicle
-    # for simplicity doubling noise in observation of position with noise of movement
-    o_x = xp .+ reshape(round.(rand(rng, MvNormal([0.0, 0.0], mdp.w)), digits=mdp.digits), (1,:))
-    # NEW ADDITION: trying out a vectorization of the agent state that captures all immediate information in one vector for RL-ing
-    o = [o_x..., z(sp)..., t(sp)]
-
     # compute reward for reaching the next state (first output of the MDP's defined objective function)
     r = mdp.obj(sp)[1]
 
     # return required items for the POMDPs.gen function (next state, observation, reward)
-    return (sp = sp, o = o, r = r)
+    return (sp = sp, r = r)
 end
-
-"""
-$(SIGNATURES)
-
-Belief-state updater for the KAgentPOMDP.
-
-It essentially reconstructs a new deterministic state out of the observation vector.
-
-#TODO: Make this non-deterministic (i.e., observation noise should enter here.)
-"""
-@with_kw struct KAgentBeliefUpdater <: POMDPs.Updater
-    state_dims = 2
-    env_dims = 3
-end
-
-"""
-$(SIGNATURES)
-
-Defines the initial belief for the KAgent POMDP.
-
-For the most part, this should be used like
-```
-POMDPs.initialize_belief(u, initialstate(pomdp))
-```
-
-This will result in the same initial belief distribution as the actual initial state distribution.
-"""
-POMDPs.initialize_belief(u::KAgentBeliefUpdater, d::Any) = d
-
-function POMDPs.update(bu::KAgentBeliefUpdater, old_b, action, obs)
-    old_s = rand(old_b)
-    xn = reshape(obs[1:bu.state_dims], (1, bu.state_dims))
-    zn = obs[bu.state_dims+1:bu.state_dims+bu.env_dims]
-    hist = push!(copy(old_s.hist), old_s.x)
-    z = push!(copy(old_s.z), zn)
-    Deterministic(KAgentState(xn, z, hist))
-end
-
-struct KWorld
-    solver::Union{MCTSSolver} # Untyped to allow for a broad array of possible types
-    dimensions::Tuple # Dimensions of 2D-world
-    inhabitants::Dict{String, KAgentMDP} # Dictionary of agents (agent POMDPs) operating in this world
-    menv::MuEnv # Global environment of the world
-    glob_landscape::GlobalObjectiveLandscape # Global objective landscape of the world
-
-    KWorld(solver, dimensions::Tuple, inhabitants::Dict, menv::MuEnv, glob_landscape::GlobalObjectiveLandscape) = new(solver,
-                                                                                                                      dimensions,
-                                                                                                                      inhabitants,
-                                                                                                                      menv, glob_landscape)
-end
-
-"""
-$(SIGNATURES)
-
-Keyword constructor for a new world.
-
-Defaults to no inhabitants (i.e., an empty dictionary.) Use `add_agent_to_world` to populate one-by-one.
-"""
-create_kworld(;
-              solver::Union{MCTSSolver}, dims::Tuple,
-              menv::MuEnv, gobj::GlobalObjectiveLandscape,
-              inhabitants::Dict=Dict{String, KAgentMDP}()) = KWorld(solver, dims, inhabitants, menv, gobj)
-
-"""
-$(SIGNATURES)
-
-Base function to add a single agent to the world.
-
-Separated in case there exists an already-defined agent MDP that needs to be added.
-"""
-add_agent_to_world(kworld::KWorld, kagent::KAgentMDP) = kworld.inhabitants[kagent.name] = kagent
-
-"""
-$(SIGNATURES)
-
-Proper keyword-based constructor to create and add a single agent to the world.
-
-Explicitly calls out all the arguments for the agent.
-Lacks safety checks.
-"""
-function add_agent_to_world(;
-                            kworld::KWorld,
-                            name::String, start_pos::Matrix,
-                            ag_flist::Vector, ag_sensor_list::Vector,
-                            dimensions::Union{Tuple, Nothing}=nothing, digits::Integer=3, mdp_horizon_discount::Float64=0.95,
-                            agent_width::Float64=0.1, agent_speed::Float64=1., ag_mvt_noise::Float64=0.05,
-                            obs_noise::Float64=0.05)
-    if isnothing(dimensions)
-        dimensions = kworld.dimensions
-    end
-    ag_menv = tangle_agent_env(kworld.menv, ag_sensor_list)
-    ag_landscape = tangle_agent_landscape(kworld.glob_landscape, ag_flist)
-    agent_mdp = init_standard_KAgentMDP(name=name, start=start_pos,
-                                        dimensions=dimensions, objl=ag_landscape, menv=ag_menv,
-                                        digits=digits, mdp_horizon_discount=mdp_horizon_discount,
-                                        agent_width=agent_width, agent_speed=agent_speed, ag_mvt_noise=ag_mvt_noise,
-                                        obs_noise=obs_noise)
-    add_agent_to_world(kworld, agent_mdp)
-end
-
-"""
-$(SIGNATURES)
-
-Dictionary-based constructor for creating and adding an agent to the world.
-
-Necessarily not only keywords as multiple dispatch does not operate on keyword args.
-"""
-function add_agent_to_world(kworld::KWorld, agent_params::Dict; add_safely::Bool=true)
-    if add_safely
-        param_list = keys(agent_params)
-        print("Checking all required components exist...")
-        @assert :name ∈ param_list "No :name specified!"
-        @assert :start ∈ param_list "No :start position specified!"
-        @assert :flist ∈ param_list "No feature list (:flist) specified!"
-        @assert :elist ∈ param_list "No observable environment characteristics (:elist) specified!"
-        print(" ok.\nChecking parameter definitions obey global world definition...")
-        @assert agent_params[:flist] ⊆ kworld.glob_landscape.feature_list "Agent feature list exceeds globally captured features!"
-        @assert agent_params[:elist] ⊆ kworld.menv.μ_order "Agent can observe environment characteristics not captured in the global environment!"
-        if :dims ∈ param_list
-            @assert agent_params[:dims][1] ≥ kworld.dimensions[1] "Agent is operating beyond the lower global bounds!"
-            @assert agent_params[:dims][2] ≤ kworld.dimensions[2] "Agent is operating beyond the upper global bounds!"
-        end
-        println(" ok.")
-    end
-    dims=get(agent_params, :dims, nothing)
-    digits=get(agent_params, :digits, 3)
-    mdp_horizon_discount=get(agent_params, :γ, 0.95)
-    agent_width=get(agent_params, :width, 0.1)
-    agent_speed=get(agent_params, :s, 1.)
-    ag_mvt_noise=get(agent_params, :w, 0.05)
-    obs_noise=get(agent_params, :v, 0.05)
-    add_agent_to_world(;
-                       kworld=kworld, name=agent_params[:name], start_pos=agent_params[:start],
-                       ag_flist=agent_params[:flist], ag_sensor_list=agent_params[:elist],
-                       dimensions=dims, digits=digits, mdp_horizon_discount=mdp_horizon_discount,
-                       agent_width=agent_width, agent_speed=agent_speed, ag_mvt_noise=ag_mvt_noise,
-                       obs_noise=obs_noise)
-end
-
-"""Populate world with a list of agents at once.
-"""
-populate_world(kworld::KWorld, kagents::Vector{KAgentMDP}) = map(kag->add_agent_to_world(kworld, kag), kagents)
-
-"""Get total number of agents.
-"""
-get_num_agents(kworld::KWorld) = length(kworld.inhabitants)

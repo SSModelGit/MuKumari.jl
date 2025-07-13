@@ -5,7 +5,7 @@ const global inch::Float64 = 96
 const global cm::Float64 = inch / 2.54
 const global pt::Float64 = 4 / 3
 
-export viz_system_single_timestep, viz_system_sim, stepthrough_sim
+export viz_system_single_timestep, viz_system_sim
 
 function viz_obcs(ax, obcs::Vector)
     for obc in obcs
@@ -61,24 +61,4 @@ function viz_system_sim(mdp::KAgentMDP, objs::AbstractObjectiveLandscape, sim_tr
         viz_agent_status(f, ax, mdp, trace_step[1], trace_step[2]; show_obj=false)
     end
     f
-end
-
-"""Complete a stepthrough of the system.
-
-Returns a list of states and actions over time.
-"""
-function stepthrough_sim(mdp::KAgentMDP, planner::MCTSPlanner, max_steps::Integer=10; plot_sim_trace=false)
-    sim_trace = Any[]
-
-    for (s,a,r) in stepthrough(mdp, planner, "s,a,r", max_steps=max_steps)
-        println("in state:\n$s")
-        println("took action: $a")
-        println("received reward: $r")
-        println("--------------------\n")
-        push!(sim_trace, [s, a])
-    end
-
-    push!(sim_trace, [@gen(:sp)(mdp, sim_trace[end][1], sim_trace[end][2]), :c])
-
-    return sim_trace
 end

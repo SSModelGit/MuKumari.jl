@@ -34,12 +34,15 @@ urgency = [(:ag1, 1.5), (:ag2, 0.5)]
 globj_scape = GlobalObjectiveLandscape(; goals=goals, obstacles=obcs, horizons=urgency)
 
 # define global environment
-menv = let μfs = [(:sin, x->sin(x[1]) + cos(x[2])), (:exp, x->100*exp(-norm(x-[8 8.])^2 / 1.)), (:lin, x->x[1]^2 + x[2])], μs = [:sin, :exp, :lin];
+menv = let μfs = [(:sin, x->sin(x[1]) + cos(x[2])),
+                  (:exp, x->100*exp(-norm(x-[8 8.])^2 / 1.)),
+                  (:lin, x->x[1]^2 + x[2])],
+           μs = [:sin, :exp, :lin];
     MuEnv(3, μs, Dict(μfs));
 end
 
 # Define world to hold all agents
-solver = MCTSSolver(n_iterations=10000, depth=20, exploration_constant=1.0)
+solver = MCTSSolver(n_iterations=1000, depth=20, exploration_constant=1.0)
 dims = (0., 10.)
 kworld = create_kworld(; solver=solver, dims=dims, gobj=globj_scape, menv=menv)
 
@@ -57,20 +60,21 @@ planner1 = solve(solver1, ag1_mdp)
 
 #= simulate(HistoryRecorder(max_steps=10), ag1_mdp, planner1, ag1_bup) =#
 
-r_sum = 0.0
-step = 0
-for (b, s, a, o, r) in stepthrough(ag1_mdp, planner1, ag1_bup, "b,s,a,o,r"; max_steps=15)
-    global step += 1
-    println("Step $step")
-    println("b = $(rand(b))")
-    @show s
-    @show a
-    @show o
-    @show r
-    global r_sum += r
-    @show r_sum
-    println()
-end
+# r_sum = 0.0
+# step = 0
+# for (b, s, a, o, r) in stepthrough(ag1_mdp, planner1, ag1_bup, "b,s,a,o,r"; max_steps=15)
+#     global step += 1
+#     println("Step $step")
+#     println("b = $(rand(b))")
+#     @show s
+#     @show a
+#     @show o
+#     println("Distance to (k-?)nearest obstacle?")
+#     @show r
+#     global r_sum += r
+#     @show r_sum
+#     println()
+# end
 
 # ag2_flist = [:sub, :aer, :ag2]
 # ag2_envs = [:sin, :lin]
