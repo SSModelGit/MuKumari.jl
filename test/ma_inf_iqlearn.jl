@@ -19,44 +19,52 @@ using JLD2: save, load
 # Agent 1: :ag1
 # Agent 2: :ag2
 
-obcs = let obcs = [];
-    push!(obcs, (:sub, Dict(:poly => [(0., 0.), (0., 0.5), (0.4, 0.3), (0.5, 0.), (0., 0.)], :risk => 3., :impact => 10.)));
-    push!(obcs, (:sub, Dict(:poly => [(4., 4.5), (5., 4.5), (7., 5.), (2., 5.), (4., 4.5)], :risk => 3., :impact => 10.)));
+function main(; plot_traces=false)
+    obcs = let obcs = [];
+        push!(obcs, (:sub, Dict(:poly => [(0., 0.), (0., 0.5), (0.4, 0.3), (0.5, 0.), (0., 0.)], :risk => 10., :impact => 10.)));
+        push!(obcs, (:sub, Dict(:poly => [(4., 4.5), (5., 4.5), (7., 5.), (2., 5.), (4., 4.5)], :risk => 10., :impact => 10.)));
+    end
+    goals = [
+        (:aer, Dict(:target=>[9.5 9.5], :strength=>10., :influence=>10., :size=>0.75)),
+        (:surf, Dict(:target=>[8.5 8.5], :strength=>10., :influence=>10., :size=>0.75)),
+        (:sub, Dict(:target=>[7.5 9.5], :strength=>10., :influence=>10., :size=>0.75))
+    ]
+    urgency = [(:ag1, 1.5), (:ag2, 0.5)]
+
+    # Define global objective landscape
+    globj_scape = GlobalObjectiveLandscape(; goals=goals, obstacles=obcs, horizons=urgency)
+
+    # define global environment
+    menv = let μfs = [(:sin, x->sin(x[1]) + cos(x[2])),
+                    (:exp, x->100*exp(-norm(x-[8 8.])^2 / 1.)),
+                    (:lin, x->x[1]^2 + x[2])],
+            μs = [:sin, :exp, :lin];
+        MuEnv(3, μs, Dict(μfs));
+    end
+
+    # Define world to hold all agents
+    # solver = MCTSSolver(n_iterations=1000, depth=20, exploration_constant=1.0)
+    solver = DPWSolver(n_iterations=1000, depth=20, exploration_constant=10.0)
+    dims = (0., 10.)
+    kworld = create_kworld(; solver=solver, dims=dims, gobj=globj_scape, menv=menv)
+
+    ag1_flist = [:sub, :surf, :ag1]
+    ag1_envs = [:sin, :exp]
+    ag1_params = Dict(:name  => "ag1",
+                    :start => [7. 7.],
+                    :flist => ag1_flist,
+                    :elist => ag1_envs)
+    add_agent_to_world(kworld, ag1_params)
+    ag1_mdp = kworld.inhabitants["ag1"]
+    ag1_bup = KAgentBeliefUpdater(state_dims=length(ag1_params[:start]), env_dims=length(ag1_envs))
+    solver1 = BeliefMCTSSolver(solver, ag1_bup)
+    planner1 = solve(solver1, ag1_mdp)
+    sim_trace1 = stepthrough_sim(ag1_mdp, planner1, ag1_bup, 15; plot_sim_trace=plot_traces);
+
+    return obcs, goals, urgency, globj_scape, menv, solver, dims, kworld, ag1_flist, ag1_envs, ag1_params, ag1_mdp, ag1_bup, solver1, planner1, sim_trace1
 end
-goals = [
-    (:aer, Dict(:target=>[9.5 9.5], :strength=>100., :influence=>10., :size=>0.5)),
-    (:surf, Dict(:target=>[8.5 8.5], :strength=>100., :influence=>10., :size=>0.5)),
-    (:sub, Dict(:target=>[7.5 9.5], :strength=>100., :influence=>10., :size=>0.5))
-]
-urgency = [(:ag1, 1.5), (:ag2, 0.5)]
 
-# Define global objective landscape
-globj_scape = GlobalObjectiveLandscape(; goals=goals, obstacles=obcs, horizons=urgency)
-
-# define global environment
-menv = let μfs = [(:sin, x->sin(x[1]) + cos(x[2])),
-                  (:exp, x->100*exp(-norm(x-[8 8.])^2 / 1.)),
-                  (:lin, x->x[1]^2 + x[2])],
-           μs = [:sin, :exp, :lin];
-    MuEnv(3, μs, Dict(μfs));
-end
-
-# Define world to hold all agents
-solver = MCTSSolver(n_iterations=1000, depth=20, exploration_constant=1.0)
-dims = (0., 10.)
-kworld = create_kworld(; solver=solver, dims=dims, gobj=globj_scape, menv=menv)
-
-ag1_flist = [:sub, :surf, :ag1]
-ag1_envs = [:sin, :exp]
-ag1_params = Dict(:name  => "ag1",
-                  :start => [3. 3.],
-                  :flist => ag1_flist,
-                  :elist => ag1_envs)
-add_agent_to_world(kworld, ag1_params)
-ag1_mdp = kworld.inhabitants["ag1"]
-ag1_bup = KAgentBeliefUpdater(state_dims=length(ag1_params[:start]), env_dims=length(ag1_envs))
-solver1 = BeliefMCTSSolver(solver, ag1_bup)
-planner1 = solve(solver1, ag1_mdp)
+obcs, goals, urgency, globj_scape, menv, solver, dims, kworld, ag1_flist, ag1_envs, ag1_params, ag1_mdp, ag1_bup, solver1, planner1, sim_trace1 = main();
 
 #= simulate(HistoryRecorder(max_steps=10), ag1_mdp, planner1, ag1_bup) =#
 

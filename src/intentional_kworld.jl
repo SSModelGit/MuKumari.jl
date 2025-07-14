@@ -1,7 +1,7 @@
 export KWorld, create_kworld, add_agent_to_world, get_num_agents
 
 @with_kw_noshow struct KWorld
-    solver::Union{MCTSSolver} # Untyped to allow for a broad array of possible types
+    solver::Union{MCTSSolver, DPWSolver} # Untyped to allow for a broad array of possible types
     dimensions::Tuple # Dimensions of 2D-world
     inhabitants::Dict{String, T} where T <: Union{KAgentMDP, KAgentPOMDP} = Dict{String, KAgentPOMDP}() # Dictionary of agents operating in this world
     menv::MuEnv # Global environment of the world
@@ -34,7 +34,7 @@ Keyword constructor for a new world.
 Defaults to no inhabitants (i.e., an empty dictionary.) Use `add_agent_to_world` to populate one-by-one.
 """
 function create_kworld(; 
-                              solver::Union{MCTSSolver}, dims::Tuple,
+                              solver::Union{MCTSSolver, DPWSolver}, dims::Tuple,
                               menv::MuEnv, gobj::GlobalObjectiveLandscape,
                               inhabitants::Dict=Dict{String, KAgentPOMDP}())
     @info "Initializing inhabitants as POMDPs"

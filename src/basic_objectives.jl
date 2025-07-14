@@ -28,7 +28,9 @@ function safety_obj(s::KAgentState, obstacles::Vector)
         for obstacle in obstacles
             dist = GO.distance(x, GI.Polygon([obstacle[:poly]]))
             if dist <= 0.
-                collided = true
+                dist = 0.
+                # No longer stopping on collision with obstacle
+                # collided = true
             end
             total_risk += obstacle[:impact] * exp(-dist^2 / obstacle[:risk])
             # total_risk += dist * obstacle[:risk]
