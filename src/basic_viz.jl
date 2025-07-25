@@ -1,4 +1,4 @@
-using CairoMakie: Figure, Axis, DataAspect, Reverse, Colorbar, poly!, heatmap!, arrows!, Circle, Point2f, Vec2f
+using CairoMakie: Figure, Axis, DataAspect, Reverse, Colorbar, poly!, heatmap!, arrows!, Circle, Point2f, Vec2f, xlims!, ylims!
 
 # Still not sure if this is the best way to handle plot sizing
 const global inch::Float64 = 96
@@ -60,5 +60,7 @@ function viz_system_sim(mdp::Union{KAgentMDP, KAgentPOMDP}, objs::AbstractObject
     for trace_step in sim_trace
         viz_agent_status(f, ax, mdp, trace_step[1], trace_step[2]; show_obj=false)
     end
+    xlims!(ax, mdp.dimensions[1], mdp.dimensions[2])
+    ylims!(ax, mdp.dimensions[1], mdp.dimensions[2])
     f
 end

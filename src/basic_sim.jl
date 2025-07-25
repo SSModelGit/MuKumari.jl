@@ -54,10 +54,21 @@ function stepthrough_sim(pomdp::KAgentPOMDP, planner::AbstractMCTSPlanner, bup::
     push!(sim_trace, [@gen(:sp)(pomdp, sim_trace[end][1], sim_trace[end][2]), :c])
 
     if plot_sim_trace
-        viz_system_sim(pomdp, pomdp.objl, sim_trace)
+        f = viz_system_sim(pomdp, pomdp.objl, sim_trace)
+        return (sim_trace, f)
     end
 
-    return sim_trace
+    return (sim_trace,)
+end
+
+onehot_action_encoder(pomdp::KAgentPOMDP) = a->onehot(a, actions(pomdp))
+
+function step_info_string(n,i,b,s,a,aoh,o,r)
+    l1 = "Iteration $n.$i\n    State:\n    $s\n    Belief:\n    $b\n"
+    l2 = "    Action taken: $a | Encoded as: $(collect(transpose(aoh))).T\n"
+    l3 = "    Observation of [next] state: $o | Reward received: $r\n"
+    l4 = "-----------------------------------------------\n"
+    return l1*l2*l3*l4
 end
 
 """
@@ -76,6 +87,68 @@ Will produce a dictionary with the following fields:
 * :t => Matrix of time step counter; 1 row per column
 * :done => Boolean Matrix of terminal status; 1 row per column; true if reached terminal state; false otherwise
 """
-function expert_simulator(; max_steps=10000)
-    @error "Not yet implemented!"
+function expert_simulator(pomdp::KAgentPOMDP, planner::AbstractMCTSPlanner, bup::KAgentBeliefUpdater;
+                          max_steps=10000, sim_limit=15, update_progress=false)
+    step_counter = 1 # this is used to index arrays; use one-indexing
+    sim_counter = 0 # used to track number of sims taken; use zero-indexing
+
+    # Prep action saving
+    one1 = onehot_action_encoder(pomdp)
+    a_dims = length(actions(pomdp))
+    a_list = Matrix{Bool}(undef, a_dims, max_steps)
+
+    # Prep state saving
+    obs_dims = bup.state_dims + bup.env_dims + 1
+    s_list = Matrix{Float64}(undef, obs_dims, max_steps)
+    sp_list = Matrix{Float64}(undef, obs_dims, max_steps)
+
+    # additional list prep
+    expert_val_list = ones(Float32,1,max_steps)
+    r_list = Matrix{Float64}(undef, 1, max_steps)
+    t_list = Matrix{Int64}(undef, 1, max_steps)
+    done_list = Matrix{Bool}(undef, 1, max_steps)
+
+    single_trace = []
+    if !update_progress;
+        p1 = Progress(max_steps; desc="Simulating expert behavior...", offset=1);
+        generate_showvalues(sn) = () -> [("Step number", sn)]
+    end
+    while step_counter ≤ max_steps
+        sim_counter += 1
+        single_trace = empty!(single_trace)
+        step = 0
+        if !update_progress; p2 = Progress(sim_limit; desc="Simulation #$(sim_counter)...", offset=3); end
+        for (b,s,sp,a,o,r) in stepthrough(pomdp, planner, bup, "b,s,sp,a,o,r", max_steps=sim_limit)
+            step += 1
+            push!(single_trace, [s,sp,a,one1(a),r,step,POMDPs.isterminal(pomdp, sp)])
+            if update_progress; print(step_info_string(sim_counter, step, b, s, a, single_trace[end][4], o, r));
+            else;               next!(p2; showvalues=generate_showvalues(step)); end
+        end
+        if single_trace[end][end]
+            # only treat as an expert if it reaches the goal and terminates
+            if step_counter + step - 1 ≤ max_steps
+                for (j, i) in enumerate(step_counter:step_counter+step-1)
+                    a_list[:,i]   .= single_trace[j][4]
+                    s_list[:,i]   .= shape_state_as_obs(pomdp, single_trace[j][1])
+                    sp_list[:,i]  .= shape_state_as_obs(pomdp, single_trace[j][2])
+                    r_list[1,i]    = single_trace[j][5]
+                    t_list[1,i]    = single_trace[j][6]
+                    done_list[1,i] = single_trace[j][7]
+                end
+                step_counter += step
+                update!(p1, step_counter; showvalues=generate_showvalues(step_counter))
+            elseif max_steps - step_counter + 1 ≤ sim_limit
+                # avoid struggling to find a suitable simulation when we're close enough to the end
+                break
+            end
+        end
+    end
+
+    return Dict(:a => a_list[:,1:step_counter-1],
+                :s => s_list[:,1:step_counter-1],
+                :sp => sp_list[:,1:step_counter-1],
+                :r => r_list[:,1:step_counter-1],
+                :t => t_list[:,1:step_counter-1],
+                :expert_val => expert_val_list[:,1:step_counter-1],
+                :done => done_list[:,1:step_counter-1])
 end

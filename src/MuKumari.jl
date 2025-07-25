@@ -8,6 +8,7 @@ using Reexport
 using DocStringExtensions
 using Parameters: @with_kw, @with_kw_noshow
 using Match
+using ProgressMeter
 ###
 
 ### Packages used to represent geometries (used in all sub-files)
@@ -18,15 +19,16 @@ import GeometryOps as GO
 ### Below are packages used exclusively in the agent definitions (`intentional_*.jl` files)
 @reexport using POMDPs
 
-using LinearAlgebra: normalize, ⋅
+using LinearAlgebra: normalize, ⋅, norm
 using Distributions: Normal, MvNormal
 using IterTools: partition
 using POMDPTools, MCTS
+using Flux: onehot
 ###
 ###############################################
 
 export MuEnv, predict_μ, predict_env, update_μf, tangle_agent_env
-export KAgentState, AbstractObjectiveLandscape, AgentObjectiveLandscape, GlobalObjectiveLandscape, tangle_agent_landscape
+export KAgentState
 
 """Type for the Mu Environment.
 
@@ -92,121 +94,6 @@ end
 state(s::KAgentState) = s.x
 z(s::KAgentState) = s.z[end]
 t(s::KAgentState) = length(s.hist)
-
-abstract type AbstractObjectiveLandscape end
-
-"""A struct containing a vector of objectives. With special format.
-
-Each element of the vector is a tuple:
-* The first element of the tuple is a symbol indicating objective type
-* The second element of the tuple contains the details of the objective itself
-
-An example is:
-```
-(:goal, Dict(:target=>[9.5 9.5], :strength=>100., :influence=>10., :size=>0.5))
-```
-
-The objective types can be:
-* Goal-attraction objective: :goal
-  * The contents should be a dictionary
-* Goal-avoidance objective: :obc
-  * The contents should be a vector of all obstacles. Look at obstacle use for more information.
-* Time horizon objective: :horz
-  * The content is a single float to indicate horizon urgency (relative to strongest reward).
-
-The final component of the struct is `f_types`. This does not need user input.
-* This is relevant only when constructing agent landscapes from a global context.
-* It will be automatically filled in based on what feature access the user defines for the agent.
-"""
-struct AgentObjectiveLandscape <: AbstractObjectiveLandscape
-    objectives::Vector
-    f_types::Vector
-
-    AgentObjectiveLandscape(objectives::Vector, f_types) = new(objectives, f_types)
-end
-
-"""Keyword-based constructor.
-"""
-AgentObjectiveLandscape(; objectives, feature_types=[]) = AgentObjectiveLandscape(objectives, feature_types)
-
-"""Global container for all the landscape information regarding obstacles, goals, etc.
-
-Consists of three fields: goals, obstacles, and horizons.
-(The feature field is automatically constructed via the keyword constructor.)
-* Each field takes an array of tuples. Each tuple consists of:
-  * The feature's landscape level, ex. a surface obstacle would be tagged :surface
-  * The feature information. The specific syntax is similar to the `AgentObjectiveLandscape`.
-
-Example:
-* We have two goals, one "aerial"- and one "surface"-level
-* We have two obstacles that are both "subsurface"
-* We have no horizons
-```
-GlobalObjectiveLandscape(
-    [(:surface, Dict(:target=>[9.5 9.5], :strength=>100., :influence=>10., :size=>0.5)),
-     (:aerial,  Dict(:target=>[7.5 7.5], :strength=>50., :influence=>10., :size=>1.5))],
-    [(:sub, Dict(:poly => [(0., 0.), (0., 0.5), (0.4, 0.3), (0.5, 0.), (0., 0.)], :risk => 3., :impact => 10.)),
-     (:sub, Dict(:poly => [(4., 4.5), (5., 4.5), (7., 5.), (2., 5.), (4., 4.5)],  :risk => 3., :impact => 10.))],
-    []
-)
-```
-"""
-struct GlobalObjectiveLandscape <: AbstractObjectiveLandscape
-    goals::Vector
-    obstacles::Vector
-    horizons::Vector
-    feature_list::Vector
-
-    GlobalObjectiveLandscape(goals::Vector, obstacles::Vector, horizons::Vector, feature_list::Vector) = new(goals, obstacles, horizons, feature_list)
-end
-
-"""Keyword-based constructor for the global landscape.
-
-Automatically constructs the feature list.
-"""
-function GlobalObjectiveLandscape(; goals::Vector, obstacles::Vector, horizons::Vector)
-    feature_set = Set()
-    map(f->push!(feature_set, f[1]), Iterators.flatten([goals, obstacles, horizons]))
-
-    GlobalObjectiveLandscape(goals, obstacles, horizons, collect(feature_set))
-end
-
-feature_name_list_from_vec(flist::Vector; base="\t", offset="    ") = mapreduce(x->"$(base)$(offset)\"$(x)\"\n", *, flist; init="")
-
-function Base.show(io::IO, gobj::GlobalObjectiveLandscape)
-    println(io, "Summary of the global objective landscape")
-    print(io, "\tGoal types: ($(length(gobj.goals)) total)\n$(feature_name_list_from_vec(map(x->x[1], gobj.goals)))")
-    print(io, "\tObstacle types: ($(length(gobj.obstacles)) total)\n$(feature_name_list_from_vec(map(x->x[1], gobj.obstacles)))")
-    print(io, "\tHorizon types: ($(length(gobj.horizons)) total)\n$(feature_name_list_from_vec(map(x->x[1], gobj.horizons)))")
-    print(io, "Features tracked in total: ($(length(gobj.feature_list)) total)\n$(feature_name_list_from_vec(gobj.feature_list; base=""))")
-end
-
-"""Helper function for tangling features from global landscape.
-
-Pulls out the features relevant to a given agent based on the list of accessible features.
-"""
-tangle_by_feature_access(features::Vector, access_list::Vector) = map(f -> f[2], filter(f -> f[1] ∈ access_list, features))
-
-"""Helper function for satisfying the specific syntax requirements of the `AgentObjectiveLandscape`.
-"""
-function tupleify_features(f_type::Symbol, fs::Vector)
-    @match f_type begin
-        :goal => map(f->(:goal, f), fs)
-        :obc  => (:obc, fs)
-        :horz => map(f->(:horz, f), fs)
-    end
-end
-
-"""Main function to derive an agent's objective landscape from the global objective landscape.
-
-Requires, in addition to the global landscape, a vector of symbols corresponding to accessible feature types.
-"""
-function tangle_agent_landscape(gobj::GlobalObjectiveLandscape, f_access::Vector)
-    @assert f_access ⊆ gobj.feature_list
-    (goals, obcs, horzs) = map(f->tangle_by_feature_access(f, f_access), [gobj.goals, gobj.obstacles, gobj.horizons])
-    objectives = [tupleify_features(:goal, goals)..., tupleify_features(:obc, obcs), tupleify_features(:horz, horzs)...]
-    AgentObjectiveLandscape(; objectives=objectives, feature_types=f_access)
-end
 
 include("basic_objectives.jl")
 include("intentional_agent.jl")

@@ -2,7 +2,7 @@
 
 julia_version = "1.10.9"
 manifest_format = "2.0"
-project_hash = "6715326356a846e2b90ffffc300ec1fa2679393d"
+project_hash = "d91fd8646bf5b9a3058aff13f505550f50941421"
 
 [[deps.ASL_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl", "Pkg"]
@@ -1887,7 +1887,7 @@ uuid = "14a3606d-f60d-562e-9121-12d972cd8159"
 version = "2023.1.10"
 
 [[deps.MuKumari]]
-deps = ["CairoMakie", "Combinatorics", "Distributions", "DocStringExtensions", "GeoInterface", "GeoMakie", "GeometryOps", "Ipopt", "IterTools", "JLD2", "JuMP", "LinearAlgebra", "MCTS", "Match", "Meshes", "POMDPLinter", "POMDPTools", "POMDPs", "Parameters", "PyCall", "Reexport", "Statistics", "cuDNN"]
+deps = ["CairoMakie", "Combinatorics", "Distributions", "DocStringExtensions", "Flux", "GeoInterface", "GeoMakie", "GeometryOps", "Ipopt", "IterTools", "JLD2", "JuMP", "LinearAlgebra", "MCTS", "Match", "Meshes", "POMDPLinter", "POMDPTools", "POMDPs", "Parameters", "ProgressMeter", "PyCall", "Reexport", "Statistics", "cuDNN"]
 path = "/home/shashank/cbase/secondary/jbase/MuKumari"
 uuid = "28f59e21-8c37-415f-8237-13dbde849877"
 version = "1.0.0-DEV"

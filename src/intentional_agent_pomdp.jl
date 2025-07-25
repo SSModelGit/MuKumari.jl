@@ -78,6 +78,8 @@ action_heading_assoc_kagent = Dict([(:n,  normalize([ 0,  1])),
                                     (:nw, normalize([-1,  1])),
                                     (:c,  [0., 0.])])
 
+shape_state_as_obs(pomdp::KAgentPOMDP, s::KAgentState) = [state(s)..., z(s)...,t(s)...]
+
 function POMDPs.gen(pomdp::KAgentPOMDP, s::KAgentState, a::Symbol, rng)
     # add noise to the action taken (both in direction and speed)
     real_a = reshape(round.(rand(rng, MvNormal(action_heading_assoc_kagent[a], pomdp.w)), digits=pomdp.digits), (1,:)) # real action factoring in noise
