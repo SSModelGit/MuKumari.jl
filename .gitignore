@@ -1,4 +1,4 @@
 /Manifest.toml
 test/Manifest.toml
-.vscode/settings.json
+.vscode/
 test/poetry.lock
