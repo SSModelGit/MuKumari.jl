@@ -100,6 +100,6 @@ include("intentional_agent.jl")
 include("intentional_agent_pomdp.jl")
 include("intentional_kworld.jl")
 include("basic_sim.jl")
-include("basic_viz.jl")
+# include("basic_viz.jl")
 
 end

@@ -3,8 +3,13 @@ using MuKumari
 using LinearAlgebra: norm, normalize
 
 using POMDPTools, MCTS, POMDPLinter
+
+# addressing weird load order bugs
 using Plots
-using CairoMakie
+using CUDA, cuDNN
+
+# Commenting out CairoMakie due to current issue compiling with Plots and GR_jll
+# using CairoMakie
 using ProgressMeter
 
 # Make sure to load Plots before Crux, because of some weird load order bug
