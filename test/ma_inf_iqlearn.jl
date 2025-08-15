@@ -17,6 +17,7 @@ using Crux
 
 using JLD2: @save, @load
 
+using Flux # Going to add this in now to start forming the networks
 ## Environment Feature types:
 # Surface:    :surf
 # Aerial:     :aer
@@ -117,8 +118,26 @@ function get_experience_data(;max_steps=10000, sim_thresh=15, update_progress=fa
 
     data = expert_simulator(ag1_mdp, planner1, ag1_bup; max_steps=max_steps, sim_limit=sim_thresh, update_progress=update_progress)
 
-    ExperienceBuffer(data, max_steps, 1, Array{Int64}[], nothing, 0)
+    anonymized_location_data = deepcopy(data)
+    anonymized_location_data[:s][1:2, :] = zeros(size(data[:s][1:2,:]))
+
+    return kworld,
+           ExperienceBuffer(data, max_steps, 1, Array{Int64}[], nothing, 0),
+           ExperienceBuffer(anonymized_location_data, max_steps, 1, Array{Int64}[], nothing, 0)
 end
+
+# use BSON loader otherwise
+kworld, exp_data, exp_data_anon = get_experience_data(;max_steps=30, sim_thresh=20, update_progress=false)
+
+mdp = kworld.inhabitants["ag1"]
+
+as = actions(mdp)
+S = state_space(mdp)
+γ = Float32(discount(mdp))
+A() = DiscreteNetwork(Chain(Dense(5, 64, relu), Dense(64, 64, relu), Dense(64, length(as))), as)
+
+Π_iql = OnlineIQLearn(π=A(), 𝒟_demo=exp_data_anon, S=S, γ=γ, N=10000, ΔN=1,
+solve(Π_iql, mdp)
 
 # sim_res = main(; plot_traces=true);
 
