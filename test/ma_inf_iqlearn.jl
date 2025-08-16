@@ -26,6 +26,62 @@ using Flux # Going to add this in now to start forming the networks
 # Agent 1: :ag1
 # Agent 2: :ag2
 
+"""Randomly generates obstacles distributed throughout space.
+
+No checking if it overlaps with goal points, on purpose.
+    Note that the average size of an obstacle is equivalent to the minimum spacing allowed between obstacle centers.
+    (i.e. any pair of obstacles can overlap partially at most.)
+"""
+function obcs_gen(flist::Vector{Symbol}, num_obcs::Integer, dims::Tuple;
+                  min_dist::Float64=0.5, size_var::Float64=0.1, obc_risk::Float64=10., obc_impact::Float64=10.)
+    # Initialize count of filled features
+    flist_count = Dict([(f, 0) for f in flist])
+
+    # Initialize list of unfilled features
+    unfilled_ftypes = filter(f->f.second < num_obcs, flist_count)
+
+    # Initialize occupancy matrix of obstacle centers
+    width = Integer(floor((dims[2] - dims[1])/min_dist) + 1) # technically half-width of the obstacle
+    obc_centers = zeros(Bool, (width, width)) # matrix is empty so all centers are false, i.e. unoccupied
+
+    # Initialize vector of obstacles
+    obcs = []
+
+    # loop until no more features to fill
+    while !isempty(unfilled_ftypes)
+        # pick center at random
+        possible_center = rand(1:width, (1,2))
+        if !obc_centers[possible_center...]
+            obc_centers[possible_center...] = true # mark center as occupied
+            physical_center = (possible_center .- 1.) .* min_dist .+ dims[1] # identify actual location of center in 2D-space
+
+            # identify four corners of obstacle using polar coordinates
+            angles = deg2rad.([rand(1:90), rand(91:180), rand(181:270), rand(271:360)])
+            radius = [(min_dist + rand() * 2 * size_var - size_var) for i in 1:4] # uniform variance \pm size_var around min_dist
+            corner_vecs = [[radius[i] * cos(angles[i]), radius[i] * sin(angles[i])] for i in 1:4] # convert to cartesian vectors
+            corners = [Tuple(physical_center .+ corner_vecs[i]) for i in 1:4] # determine Tuple cartesian coordinates for corners
+
+            relevant_feature_mask = rand(Bool, (length(unfilled_ftypes),)) # determine which features this obstacle is relevant to
+            # construct the obstacle representation for each applicable feature type
+            for f in collect(keys(unfilled_ftypes))[relevant_feature_mask]
+                flist_count[f] += 1 # update count for no. of obstacles for given feature
+                # TODO: add some variance w.r.t. the risk and impact of an obstacle
+                push!(obcs, (f, Dict(:poly => copy(corners), :risk => obc_risk, :impact => obc_impact)))
+            end
+
+            # update unfilled types
+            unfilled_ftypes = filter(f->f.second < num_obcs, flist_count)
+        end
+    end
+
+    return obcs
+end
+
+function main(dims::Tuple=(0., 10.), flist::Vector{Symbol}=[:aer, :surf, :sub]; num_obcs::Integer=5)
+    obcs = obcs_gen(flist, num_obcs, dims)
+    
+end
+
 function main(; plot_traces=false)
     obcs = let obcs = [];
         push!(obcs, (:sub, Dict(:poly => [(0., 0.), (0., 0.5), (0.4, 0.3), (0.5, 0.), (0., 0.)], :risk => 10., :impact => 10.)));
@@ -126,19 +182,21 @@ function get_experience_data(;max_steps=10000, sim_thresh=15, update_progress=fa
            ExperienceBuffer(anonymized_location_data, max_steps, 1, Array{Int64}[], nothing, 0)
 end
 
-# use BSON loader otherwise
-kworld, exp_data, exp_data_anon = get_experience_data(;max_steps=30, sim_thresh=20, update_progress=false)
+# # use BSON loader otherwise
+# kworld, exp_data, exp_data_anon = get_experience_data(;max_steps=30, sim_thresh=20, update_progress=false)
 
-mdp = kworld.inhabitants["ag1"]
+# mdp = kworld.inhabitants["ag1"]
 
-as = actions(mdp)
-S = state_space(mdp)
-γ = Float32(discount(mdp))
-A() = DiscreteNetwork(Chain(Dense(5, 64, relu), Dense(64, 64, relu), Dense(64, length(as))), as)
+# as = actions(mdp)
+# S = state_space(mdp)
+# γ = Float32(discount(mdp))
+# A() = DiscreteNetwork(Chain(Dense(5, 64, relu), Dense(64, 64, relu), Dense(64, length(as))), as)
 
-Π_iql = OnlineIQLearn(π=A(), 𝒟_demo=exp_data_anon, S=S, γ=γ, N=10000, ΔN=1,
-solve(Π_iql, mdp)
+# Π_iql = OnlineIQLearn(π=A(), 𝒟_demo=exp_data_anon, S=S, γ=γ, N=10000, ΔN=1,
+# solve(Π_iql, mdp)
 
+
+########################### Introducing second agent!!!
 # sim_res = main(; plot_traces=true);
 
 # obcs, goals, urgency, globj_scape, menv, solver, dims, kworld, ag1_flist, ag1_envs, ag1_params, ag1_mdp, ag1_bup, solver1, planner1, sim_trace1 = sim_res

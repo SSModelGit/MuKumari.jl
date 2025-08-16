@@ -96,6 +96,8 @@ function POMDPs.gen(pomdp::KAgentPOMDP, s::KAgentState, a::Symbol, rng)
 
     # POMDP observation refers to state observation. Noise will occur in the position of the vehicle
     # for simplicity doubling noise in observation of position with noise of movement
+    # Defining the observation state as:
+    ## [Position [x], Position [y], Env obs vec, top-k nearest obstacles (vector-to), 8 quadrant obstacle count vector, [same near&count for goals], time]
     o_x = xp .+ reshape(round.(rand(rng, MvNormal([0.0, 0.0], pomdp.w)), digits=pomdp.digits), (1,:))
     # NEW ADDITION: trying out a vectorization of the agent state that captures all immediate information in one vector for RL-ing
     o = [o_x..., z(sp)..., t(sp)]
