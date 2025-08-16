@@ -77,9 +77,91 @@ function obcs_gen(flist::Vector{Symbol}, num_obcs::Integer, dims::Tuple;
     return obcs
 end
 
-function main(dims::Tuple=(0., 10.), flist::Vector{Symbol}=[:aer, :surf, :sub]; num_obcs::Integer=5)
+function goal_gen(flist::Vector{Symbol}, num_goals::Integer, dims::Tuple;
+                  size::Float64=0.75, min_dist::Float64=0.5, strength::Float64=10., influence::Float64=5.)
+    # count number of applicable features
+    num_features = length(flist)
+
+    # initialize goal list
+    goal_list = []
+
+    # initialize goal occupancy grid
+    width = Integer(floor((dims[2] - dims[1])/min_dist) + 1) # technically half-width
+    goal_centers = zeros(Bool, (width, width)) # matrix is empty so all centers are false, i.e. unoccupied
+
+    # construct a number of goals. Goals can count towards multiple features (leading to a total count > num_goals)
+    for g in 1:num_goals
+        # identify features this goal will apply to
+        gtypes = flist[rand(Bool, num_features)]
+
+        # pick at random using equidistant spacings across dimensions (using min_dist as the spacing constant)
+        possible_goal = rand(1:width, (1,2))
+        if !goal_centers[possible_goal...]
+            goal_centers[possible_goal...] = true
+            
+            # convert into physical spacing
+            physical_goal = (possible_goal .- 1.) .* min_dist .+ dims[1]
+
+            # loop through all the goal types
+            for gtype in gtypes
+                push!(goal_list, (gtype, Dict(:target=>reshape(physical_goal, (1,2)), :strength=>strength, :influence=>influence, :size=>size)))
+            end
+        end
+    end
+    return goal_list
+end
+
+function init_world(dims::Tuple=(0., 10.), flist::Vector{Symbol}=[:aer, :surf, :sub]; num_obcs::Integer=5, num_goals::Integer=3)
     obcs = obcs_gen(flist, num_obcs, dims)
-    
+    goals = goal_gen(flist, num_goals, dims)
+    urgency = [(:ag1, 1.5), (:ag2, 0.5), (:ag3, 1.5)]
+
+    # Define global objective landscape
+    globj_scape = GlobalObjectiveLandscape(; goals=goals, obstacles=obcs, horizons=urgency)
+
+    # define global environment
+    menv = let μfs = [(:sin, x->sin(x[1]) + cos(x[2])),
+                    (:exp, x->100*exp(-norm(x-[8 8.])^2 / 1.)),
+                    (:lin, x->x[1]^2 + x[2])],
+            μs = [:sin, :exp, :lin];
+        MuEnv(3, μs, Dict(μfs));
+    end
+
+    # Define world to hold all agents
+    solver = MCTSSolver(n_iterations=1000, depth=20, exploration_constant=10.0)
+    # solver = DPWSolver(n_iterations=1000, depth=20, exploration_constant=1.0)
+    kworld = create_kworld(; solver=solver, dims=dims, gobj=globj_scape, menv=menv)
+
+    return kworld
+end
+
+function init_agent(kworld::KWorld, name::String="ag1";
+                    ag_flist::Vector{Symbol}, ag_envs::Vector{Symbol}, start::Union{Nothing, Matrix}=nothing,
+                    w::Float64=0., v::Float64=0.)
+    if isnothing(start)
+        let dims=kworld.dimensions
+            start = (rand(1:(Integer(floor((dims[2] - dims[1])/0.5) + 1)), (1,2)) .- 1.) .* 0.5 .+ dims[1]
+        end
+    end
+    ag_params = Dict(:name  => name,
+                    :start => start,
+                    :flist => copy(ag_flist),
+                    :elist => copy(ag_envs),
+                    :w => w, :v => v) # no noise for our simple buddy
+    add_agent_to_world(kworld, ag_params)
+    ag_mdp = kworld.inhabitants[name]
+    ag_bup = KAgentBeliefUpdater(state_dims=length(ag_params[:start]), env_dims=length(ag_envs))
+
+    return ag_mdp, ag_bup
+end
+
+function main(dims::Tuple=(0., 10.); num_obcs::Integer=5, num_goals::Integer=3)
+    kworld = init_world((0., 10.), [:aer, :surf, :sub]; num_obcs=5, num_goals=3)
+    ag1_mdp, ag1_bup = init_agent(kworld, "ag1"; ag_flist=[:sub, :surf, :ag1], ag_envs=[:sin, :exp])
+    ag2_mdp, ag2_bup = init_agent(kworld, "ag2"; ag_flist=[:surf, :aer, :ag2], ag_envs=[:exp, :lin])
+    ag3_mdp, ag3_bup = init_agent(kworld, "ag3"; ag_flist=[:sub, :ag3], ag_envs=[:sin, :lin])
+
+    return kworld
 end
 
 function main(; plot_traces=false)
