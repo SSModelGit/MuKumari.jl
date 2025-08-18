@@ -7,6 +7,7 @@ export KAgentPOMDP, init_standard_KAgentPOMDP, KAgentBeliefUpdater
     boxworld::GI.Polygon # 2D world constructed from dimensions
     objl::AgentObjectiveLandscape # Agent objective landscape
     obcs::Vector # 2D world obstacles (holes in the traversable region) - separated from landscape for convenience
+    goals::Vector # 2D world goals - separated from landscape for convenience
     obj::Function # objective function: must return two values, [Immediate reward for reaching state (KAgentState), Boolean True if Objective Accomplished]
     world::GI.Polygon # Effectively traversable 2D world (built from boxworld and obcs)
     width::Float64
@@ -23,9 +24,10 @@ function init_standard_KAgentPOMDP(;
     dimensions::Tuple, objl::AgentObjectiveLandscape, menv::MuEnv,
     digits::Integer=3, agent_width::Float64=0.1, agent_speed::Float64=1., ag_mvt_noise::Float64=0.05, obs_noise::Float64=0.05,
     mdp_horizon_discount::Float64=0.95)
-    let d=dimensions, boxworld=GI.Polygon([[(d[1], d[1]), (d[1], d[2]), (d[2], d[2]), (d[2], d[1]), (d[1], d[1])]]), obcs=obcs_from_landscape(objl)
+    let d=dimensions, boxworld=GI.Polygon([[(d[1], d[1]), (d[1], d[2]), (d[2], d[2]), (d[2], d[1]), (d[1], d[1])]]),
+        obcs=obcs_from_landscape(objl), goals=goals_from_landscape(objl)
         KAgentPOMDP(name=name, start=start,
-                    dimensions=d, boxworld = boxworld, objl=objl, obcs=obcs,
+                    dimensions=d, boxworld = boxworld, objl=objl, obcs=obcs, goals=goals,
                     obj=obj_from_landscape(objl; digits=digits),
                     world=GI.Polygon([GI.getexterior(boxworld), map(o->GI.getexterior(o), obcs)...]),
                     width=agent_width,
@@ -52,7 +54,11 @@ POMDPs.isterminal(pomdp::KAgentPOMDP, s::KAgentState) = pomdp.obj(s)[2]
 
 POMDPs.initialstate(pomdp::KAgentPOMDP) = Deterministic(blindstart_KAgentState(pomdp, pomdp.start))
 
-POMDPs.initialobs(pomdp::KAgentPOMDP, s) = Deterministic([state(s)..., z(s)..., t(s)])
+nearest_obstacles(pomdp::KAgentPOMDP, s) = nearest_k_geometries(s.x, pomdp.obcs, 5) |> Iterators.flatten |> collect |> Iterators.flatten |> collect
+nearest_goals(pomdp::KAgentPOMDP, s) = nearest_k_geometries(s.x, pomdp.goals, 3) |> Iterators.flatten |> collect |> Iterators.flatten |> collect
+
+# POMDPs.initialobs(pomdp::KAgentPOMDP, s) = Deterministic([state(s)..., z(s)..., t(s)])
+POMDPs.initialobs(pomdp::KAgentPOMDP, s) = Deterministic([state(s)..., z(s)..., nearest_obstacles(pomdp, s)..., nearest_goals(pomdp, s)..., t(s)])
 
 POMDPs.discount(pomdp::KAgentPOMDP) = pomdp.γ
 
@@ -96,11 +102,11 @@ function POMDPs.gen(pomdp::KAgentPOMDP, s::KAgentState, a::Symbol, rng)
 
     # POMDP observation refers to state observation. Noise will occur in the position of the vehicle
     # for simplicity doubling noise in observation of position with noise of movement
+    # NEW ADDITION: trying out a vectorization of the agent state that captures all immediate information in one vector for RL-ing
     # Defining the observation state as:
     ## [Position [x], Position [y], Env obs vec, top-k nearest obstacles (vector-to), 8 quadrant obstacle count vector, [same near&count for goals], time]
     o_x = xp .+ reshape(round.(rand(rng, MvNormal([0.0, 0.0], pomdp.w)), digits=pomdp.digits), (1,:))
-    # NEW ADDITION: trying out a vectorization of the agent state that captures all immediate information in one vector for RL-ing
-    o = [o_x..., z(sp)..., t(sp)]
+    o = [o_x..., z(sp)..., nearest_obstacles(pomdp, sp)..., nearest_goals(pomdp, sp)..., t(sp)]
 
     # compute reward for reaching the next state (first output of the MDP's defined objective function)
     r = pomdp.obj(sp)[1]

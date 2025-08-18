@@ -33,12 +33,13 @@ No checking if it overlaps with goal points, on purpose.
     (i.e. any pair of obstacles can overlap partially at most.)
 """
 function obcs_gen(flist::Vector{Symbol}, num_obcs::Integer, dims::Tuple;
-                  min_dist::Float64=0.5, size_var::Float64=0.1, obc_risk::Float64=10., obc_impact::Float64=10.)
+                  min_dist::Float64=0.5, size_var::Float64=0.1, obc_risk::Float64=10., obc_impact::Float64=10., digits=2)
     # Initialize count of filled features
     flist_count = Dict([(f, 0) for f in flist])
 
     # Initialize list of unfilled features
     unfilled_ftypes = filter(f->f.second < num_obcs, flist_count)
+
 
     # Initialize occupancy matrix of obstacle centers
     width = Integer(floor((dims[2] - dims[1])/min_dist) + 1) # technically half-width of the obstacle
@@ -54,12 +55,15 @@ function obcs_gen(flist::Vector{Symbol}, num_obcs::Integer, dims::Tuple;
         if !obc_centers[possible_center...]
             obc_centers[possible_center...] = true # mark center as occupied
             physical_center = (possible_center .- 1.) .* min_dist .+ dims[1] # identify actual location of center in 2D-space
+            physical_center = reshape(physical_center, (2,))
 
             # identify four corners of obstacle using polar coordinates
             angles = deg2rad.([rand(1:90), rand(91:180), rand(181:270), rand(271:360)])
             radius = [(min_dist + rand() * 2 * size_var - size_var) for i in 1:4] # uniform variance \pm size_var around min_dist
             corner_vecs = [[radius[i] * cos(angles[i]), radius[i] * sin(angles[i])] for i in 1:4] # convert to cartesian vectors
             corners = [Tuple(physical_center .+ corner_vecs[i]) for i in 1:4] # determine Tuple cartesian coordinates for corners
+            corners = map(v->round.(v, digits=2), corners) # clean up slightly so we avoid nasty issues with floating point precision
+            push!(corners, corners[1]) # need to close off the geometry by repeating the first point
 
             relevant_feature_mask = rand(Bool, (length(unfilled_ftypes),)) # determine which features this obstacle is relevant to
             # construct the obstacle representation for each applicable feature type
@@ -81,6 +85,11 @@ function goal_gen(flist::Vector{Symbol}, num_goals::Integer, dims::Tuple;
                   size::Float64=0.75, min_dist::Float64=0.5, strength::Float64=10., influence::Float64=5.)
     # count number of applicable features
     num_features = length(flist)
+    # Initialize count of filled features
+    flist_count = Dict([(f, 0) for f in flist])
+
+    # Initialize list of unfilled features
+    unfilled_ftypes = filter(f->f.second < num_goals, flist_count)
 
     # initialize goal list
     goal_list = []
@@ -90,7 +99,7 @@ function goal_gen(flist::Vector{Symbol}, num_goals::Integer, dims::Tuple;
     goal_centers = zeros(Bool, (width, width)) # matrix is empty so all centers are false, i.e. unoccupied
 
     # construct a number of goals. Goals can count towards multiple features (leading to a total count > num_goals)
-    for g in 1:num_goals
+    while !isempty(unfilled_ftypes)
         # identify features this goal will apply to
         gtypes = flist[rand(Bool, num_features)]
 
@@ -104,8 +113,12 @@ function goal_gen(flist::Vector{Symbol}, num_goals::Integer, dims::Tuple;
 
             # loop through all the goal types
             for gtype in gtypes
+                flist_count[gtype] += 1
                 push!(goal_list, (gtype, Dict(:target=>reshape(physical_goal, (1,2)), :strength=>strength, :influence=>influence, :size=>size)))
             end
+
+            # update unfilled types
+            unfilled_ftypes = filter(f->f.second < num_goals, flist_count)
         end
     end
     return goal_list

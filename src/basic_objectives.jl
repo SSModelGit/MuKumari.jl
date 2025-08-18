@@ -239,7 +239,19 @@ function obcs_from_landscape(objs::AgentObjectiveLandscape)
             _    => nothing
         end
     end
-    map(filter(!isnothing, obcs)[1]) do obc
+    map(unique(filter(!isnothing, obcs)[1])) do obc
         GI.Polygon([obc[:poly]])
+    end
+end
+
+function goals_from_landscape(objs::AgentObjectiveLandscape)
+    goals = map(objs.objectives) do obj
+        @match obj[1] begin
+            :goal => obj[2]
+            _     => nothing
+        end
+    end
+    map(filter(!isnothing, unique(goals))) do goal
+        GI.Point(Tuple(goal[:target]))
     end
 end

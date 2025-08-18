@@ -96,6 +96,7 @@ z(s::KAgentState) = s.z[end]
 t(s::KAgentState) = length(s.hist)
 
 include("basic_objectives.jl")
+include("basic_geometry.jl")
 include("intentional_agent.jl")
 include("intentional_agent_pomdp.jl")
 include("intentional_kworld.jl")
