@@ -89,7 +89,7 @@ Will produce a dictionary with the following fields:
 """
 function expert_simulator(pomdp::KAgentPOMDP, planner::AbstractMCTSPlanner, bup::KAgentBeliefUpdater;
                           max_steps=10000, sim_limit=15, obs_dims::Union{Nothing, Integer}=nothing,
-                          update_progress=false, updater_offset=1)
+                          debug_progress=false, updater_offset=1)
     step_counter = 1 # this is used to index arrays; use one-indexing
     sim_counter = 0 # used to track number of sims taken; use zero-indexing
 
@@ -113,7 +113,7 @@ function expert_simulator(pomdp::KAgentPOMDP, planner::AbstractMCTSPlanner, bup:
 
     single_trace = []
     broke = false
-    if !update_progress;
+    if !debug_progress;
         p1 = Progress(max_steps; desc="Simulating expert behavior...", offset=updater_offset);
         generate_showvalues(sn) = () -> [("Step number", sn)]
     end
@@ -121,11 +121,11 @@ function expert_simulator(pomdp::KAgentPOMDP, planner::AbstractMCTSPlanner, bup:
         sim_counter += 1
         single_trace = empty!(single_trace)
         step = 0
-        if !update_progress; p2 = Progress(sim_limit; desc="Simulation #$(sim_counter)...", offset=updater_offset+2); end
+        if !debug_progress; p2 = Progress(sim_limit; desc="Simulation #$(sim_counter)...", offset=updater_offset+2); end
         for (b,s,sp,a,o,r) in stepthrough(pomdp, planner, bup, "b,s,sp,a,o,r", max_steps=sim_limit)
             step += 1
             push!(single_trace, [s,sp,a,one1(a),r,step,POMDPs.isterminal(pomdp, sp)])
-            if update_progress; print(step_info_string(sim_counter, step, b, s, a, single_trace[end][4], o, r));
+            if debug_progress; print(step_info_string(sim_counter, step, b, s, a, single_trace[end][4], o, r));
             else;               next!(p2; showvalues=generate_showvalues(step)); end
         end
         if single_trace[end][end]

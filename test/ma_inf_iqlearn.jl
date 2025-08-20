@@ -33,7 +33,11 @@ base_solver() = MCTSSolver(n_iterations=1000, depth=20, exploration_constant=10.
 minmax_to_dims(x, dims::Tuple; tol=1e-5) = min(max(x, dims[1]+tol), dims[2]-tol)
 constrain_to_dims(p::Tuple, dims::Tuple; tol=1e-5) = [minmax_to_dims(p[1], dims; tol=tol), minmax_to_dims(p[2], dims; tol=tol)]
 
-"""Randomly generates obstacles distributed throughout space.
+"""
+    obcs_gen(flist::Vector{Symbol}, num_obcs::Integer, dims::Tuple;
+                  min_dist::Float64=0.5, size_var::Float64=0.1, obc_risk::Float64=10., obc_impact::Float64=10., digits=2)
+
+Randomly generates obstacles distributed throughout space.
 
 No checking if it overlaps with goal points, on purpose.
     Note that the average size of an obstacle is equivalent to the minimum spacing allowed between obstacle centers.
@@ -89,6 +93,15 @@ function obcs_gen(flist::Vector{Symbol}, num_obcs::Integer, dims::Tuple;
     return obcs
 end
 
+"""
+    goal_gen(flist::Vector{Symbol}, num_goals::Integer, dims::Tuple;
+                  size::Float64=0.75, min_dist::Float64=0.5, strength::Float64=10., influence::Float64=5.)
+
+Randomly generates goals distributed throughout space.
+
+No checking if it overlaps with obstacles, on purpose.
+    Note that the average size of an goal is separate from the minimum spacing allowed between goal centers (and is by default bigger!)
+"""
 function goal_gen(flist::Vector{Symbol}, num_goals::Integer, dims::Tuple;
                   size::Float64=0.75, min_dist::Float64=0.5, strength::Float64=10., influence::Float64=5.)
     # count number of applicable features
@@ -132,6 +145,13 @@ function goal_gen(flist::Vector{Symbol}, num_goals::Integer, dims::Tuple;
     return goal_list
 end
 
+"""
+    init_world(dims::Tuple=(0., 10.), flist::Vector{Symbol}=[:aer, :surf, :sub]; num_obcs::Integer=5, num_goals::Integer=3)
+
+Constructs a world to instantiate agents within. Currently uses fixed presets for the world environment model and horizon objectives.
+
+Uses the functions `obcs_gen` and `goal_gen` to randomly populate obstacles and goals within the world's dimensions.
+"""
 function init_world(dims::Tuple=(0., 10.), flist::Vector{Symbol}=[:aer, :surf, :sub]; num_obcs::Integer=5, num_goals::Integer=3)
     obcs = obcs_gen(flist, num_obcs, dims)
     goals = goal_gen(flist, num_goals, dims)
@@ -156,6 +176,22 @@ function init_world(dims::Tuple=(0., 10.), flist::Vector{Symbol}=[:aer, :surf, :
     return kworld
 end
 
+"""
+    init_agent(kworld::KWorld, name::String="ag1";
+                    ag_flist::Vector{Symbol}, ag_envs::Vector{Symbol}, start::Union{Nothing, Matrix}=nothing,
+                    w::Float64=0., v::Float64=0.)
+
+Initializes an agent within a provided world using the specified parameters.
+
+Not all agent parameters can be specified - ex. Agent MDP horizon γ.
+    - Read documentation on `MuKumari.add_agent_to_world` for more details.
+
+When a start position is not provided (i.e. the keyword argument is set to `nothing`, as is the default), a random start position is chosen instead.
+In case the random position chosen is within a goal point (rendering the problem trivial), the initialization function will try again.
+    For simplicity, I implemented checking this by using `POMDPs.isterminal`, which also unfortunately means the entire agent needs to be constructed first.
+    In turn, this means that I recursively call the function if the first attempt fails (`start`=`nothing`), and return the first success.
+        Likewise, if the provided start value fails, it also triggers the recursive calls.
+"""
 function init_agent(kworld::KWorld, name::String="ag1";
                     ag_flist::Vector{Symbol}, ag_envs::Vector{Symbol}, start::Union{Nothing, Matrix}=nothing,
                     w::Float64=0., v::Float64=0.)
@@ -184,9 +220,35 @@ function init_agent(kworld::KWorld, name::String="ag1";
     end
 end
 
+function combine_experience_buffers(exp1::ExperienceBuffer, exp2::ExperienceBuffer)
+    # define addn. parameters for buffer
+    total_elements = exp1.elements + exp2.elements
+    # doing a bunch of if statements bc idk what to do if they evaluate to not true
+    if (iszero(exp1.total_count) && iszero(exp2.total_count)); total_count = 0; end
+    if (isnothing(exp1.priority_params) && isnothing(exp2.priority_params)); priority_params = nothing; end
+    if (isempty(exp1.indices) && isempty(exp2.indices)); indices = Array{Int64}[]; end
+    if (isone(exp1.next_ind) && isone(exp2.next_ind)); next_ind = 1; end
+
+    # combine data elements
+    data = Dict([(k, hcat(exp1.data[k], exp2.data[k])) for k in keys(exp1.data)])
+    return ExperienceBuffer(data, total_elements, next_ind, indices, priority_params, total_count)
+end
+
+"""
+    gen_experience(kworld::KWorld, name::String, ag_flist::Vector{Symbol}, num_instances::Integer=10;
+                        max_steps=30, sim_thresh=15, debug_progress=false, updater_offset=1)
+
+Generate expert simulations within a given world, under specified parameters. Agents will be named as `name_#`, where # is the simulation instance number.
+
+Constructs `num_instances` instantations of an agent defined by the feature list parameter `ag_flist` relative to the provided `kworld`.
+    Simulates each instance to within `sim_thresh` steps of `max_steps`, using `MuKumari.expert_simulator` as the simulation method.
+    Set `debug_progress` to false to not get debug output, and instead get a progress bar. 
+        Likewise, leave the `updater_offset` as +2 to the last offset of any progress bars you are using in your main loops.
+"""
 function gen_experience(kworld::KWorld, name::String, ag_flist::Vector{Symbol}, num_instances::Integer=10;
-                        num_obcs::Integer=5, num_goals::Integer=3, max_steps=30, sim_thresh=15, update_progress=false, updater_offset=1)
+                        max_steps=30, sim_thresh=15, debug_progress=false, updater_offset=1)
     experiences = []
+    total_experience = Any[nothing, nothing]
     generate_showvalues(sn) = () -> [("Instance #", sn)]
     updater = Progress(num_instances; desc="Simulating instances of agent: $(name)...", offset=updater_offset)
     for k in 1:num_instances
@@ -198,24 +260,49 @@ function gen_experience(kworld::KWorld, name::String, ag_flist::Vector{Symbol}, 
 
         data = expert_simulator(ag_mdp, planner, ag_bup;
                                 max_steps=max_steps, sim_limit=sim_thresh, obs_dims=obs_dims,
-                                update_progress=update_progress, updater_offset=updater_offset+2)
+                                debug_progress=debug_progress, updater_offset=updater_offset+2)
         next!(updater; showvalues=generate_showvalues(k))
 
         anonymized_location_data = deepcopy(data)
         anonymized_location_data[:s][1:2, :] = zeros(size(data[:s][1:2,:]))
         push!(experiences, (ExperienceBuffer(data, max_steps, 1, Array{Int64}[], nothing, 0),
                             ExperienceBuffer(anonymized_location_data, max_steps, 1, Array{Int64}[], nothing, 0)))
+        for i in 1:2
+            if isnothing(total_experience[i])
+                total_experience[i] = experiences[end][i]
+            else
+                total_experience[i] = combine_experience_buffers(experiences[end][i], total_experience[i])
+            end
+        end
     end
 
-    return experiences
+    return Dict(:ind_exps=>experiences, :total_exp=>total_experience)
 end
 
-function main(; max_steps=30, sim_thresh=15, num_instances=10, plot_traces=false)
-    dims = (0., 10.)
-    # kworld, agent_mdps, agent_beliefs = construct_problem(dims; num_goals=1)
-    kworld = init_world((0., 10.), [:sub, :surf, :aer]; num_obcs=5, num_goals=3)
-    # sim_trace1 = stepthrough_sim(ag1_mdp, planner1, ag1_bup, 15; plot_sim_trace=plot_traces);
+"""
+    main(; max_steps=30, sim_thresh=15, num_instances=10, plot_traces=false)
 
+Main function for this file. Made to help generate data for future multi-agent objective inference and planning using the IQ-Learn technique.
+
+* `max_steps`: the maximum number of timestep obversations that should be gathered for any agent instance.
+* `sim_thresh`: the max number of steps any agent simulation should allowed to run, even if the agent hasn't reached the terminal state yet.
+    * This is also to determine if we have sufficiently approached the max number of observations that should be gathered.
+* `num_instances`: Number of agent instantiations to simulate per agent MDP.
+    * Note that instantiations only differ by the starting position.
+* `plot_traces`: currently unused
+
+Returns: `[kworld, data]`
+    * `kworld`: KWorld object, containing information on all MDP problems used (including obstacles, goals, etc.)
+    * `data`: Dictionary of all agent experiences. Is a vector of ExperienceBuffers (defined in Crux.jl).
+        * Also contains `kworld` under the key "kworld"
+        * Also contains a cumulative ExperienceBuffer under "total"
+"""
+function main(; max_steps=30, sim_thresh=15, num_instances=10, plot_traces=false, max_agent_count=7)
+    # define KWorld object
+    dims = (0., 10.)
+    kworld = init_world((0., 10.), [:sub, :surf, :aer]; num_obcs=5, num_goals=3)
+
+    # define agents by features relative to the world they will operate within
     ag_flists = Dict("ag1" => [:sub, :a1],
                      "ag2" => [:surf, :a1],
                      "ag3" => [:aer, :a1],
@@ -224,14 +311,35 @@ function main(; max_steps=30, sim_thresh=15, num_instances=10, plot_traces=false
                      "ag6" => [:sub, :aer, :a1],
                      "ag7" => [:sub, :surf, :aer, :a1])
 
-    data = Dict()
+    # keep the number within realm of possibility
+    max_agent_count = min(length(ag_flists), max_agent_count)
+
+    # initialize data container
+    data = Dict{String, Any}("kworld" => kworld)
+    total_experience = nothing # cumulative buffer (init as nothing)
+
+    # progress bar stuff
     generate_showvalues(sn) = () -> [("Agent #", sn)]
     updater = Progress(length(ag_flists); desc="Generating expert data...", offset=1)
     for (i, p) in enumerate(ag_flists)
+        # generate data for agent
         data[p[1]] = gen_experience(kworld, p[1], p[2], num_instances; max_steps=max_steps, sim_thresh=sim_thresh, updater_offset=3)
+
+        # update cumulative buffer
+        if isnothing(total_experience)
+            total_experience = data[p[1]][:total_exp]
+        else
+            total_experience = [combine_experience_buffers(data[p[1]][:total_exp][i], total_experience[i]) for i in 1:2]
+        end
+
+        # update progress bar
         next!(updater, showvalues=generate_showvalues(i))
-        if i > 3; break; end
+        # if we're crossing the upper limit of simulations, finish.
+        if i > max_agent_count; break; end
     end
+
+    # store cumulative buffer
+    data["total"] = total_experience
 
     println("\n"^(1+2*4))
     return kworld, data
