@@ -59,7 +59,8 @@ function describe_objectives(objs::Vector; base="", offset="    ", eol="\n")
     mapreduce(*, objs; init="") do obj
         @match obj[1] begin
             :goal => describe_single_obj(obj; base=base, offset=offset, eol=eol)
-            :obc  => mapreduce(o->describe_single_obj((:obcs, o); base=base, offset=offset, eol=eol), *, obj[2]; init="")
+            :sobc  => mapreduce(o->describe_single_obj((:obcs, o); base=base, offset=offset, eol=eol), *, obj[2]; init="")
+            :robc  => mapreduce(o->describe_single_obj((:obcs, o); base=base, offset=offset, eol=eol), *, obj[2]; init="")
             :horz => describe_single_obj(obj; base=base, offset=offset, eol=eol)
         end
     end
@@ -97,19 +98,24 @@ struct GlobalObjectiveLandscape <: AbstractObjectiveLandscape
     obstacles::Vector
     horizons::Vector
     feature_list::Vector
+    risk_acceptance::Bool
 
-    GlobalObjectiveLandscape(goals::Vector, obstacles::Vector, horizons::Vector, feature_list::Vector) = new(goals, obstacles, horizons, feature_list)
+    GlobalObjectiveLandscape(goals::Vector,
+                             obstacles::Vector,
+                             horizons::Vector,
+                             feature_list::Vector,
+                             risk_acceptance::Bool) = new(goals, obstacles, horizons, feature_list, risk_acceptance)
 end
 
 """Keyword-based constructor for the global landscape.
 
 Automatically constructs the feature list.
 """
-function GlobalObjectiveLandscape(; goals::Vector, obstacles::Vector, horizons::Vector)
+function GlobalObjectiveLandscape(; goals::Vector, obstacles::Vector, horizons::Vector, risk_acceptance::Bool=true)
     feature_set = Set()
     map(f->push!(feature_set, f[1]), Iterators.flatten([goals, obstacles, horizons]))
 
-    GlobalObjectiveLandscape(goals, obstacles, horizons, collect(feature_set))
+    GlobalObjectiveLandscape(goals, obstacles, horizons, collect(feature_set), risk_acceptance)
 end
 
 feature_name_list_from_vec(flist::Vector; base=" ", offset="", eol="") = mapreduce(x->"$(base)$(offset)\"$(x)\"$(eol)", *, flist; init="")
@@ -143,7 +149,8 @@ tangle_by_feature_access(features::Vector, access_list::Vector) = map(f -> f[2],
 function tupleify_features(f_type::Symbol, fs::Vector)
     @match f_type begin
         :goal => map(f->(:goal, f), fs)
-        :obc  => (:obc, fs)
+        :sobc  => (:sobc, fs)
+        :robc  => (:robc, fs)
         :horz => map(f->(:horz, f), fs)
     end
 end
@@ -155,7 +162,11 @@ Requires, in addition to the global landscape, a vector of symbols corresponding
 function tangle_agent_landscape(gobj::GlobalObjectiveLandscape, f_access::Vector)
     @assert f_access ⊆ gobj.feature_list
     (goals, obcs, horzs) = map(f->tangle_by_feature_access(f, f_access), [gobj.goals, gobj.obstacles, gobj.horizons])
-    objectives = [tupleify_features(:goal, goals)..., tupleify_features(:obc, obcs), tupleify_features(:horz, horzs)...]
+    if gobj.risk_acceptance
+        objectives = [tupleify_features(:goal, goals)..., tupleify_features(:robc, obcs), tupleify_features(:horz, horzs)...]
+    else
+        objectives = [tupleify_features(:goal, goals)..., tupleify_features(:sobc, obcs), tupleify_features(:horz, horzs)...]
+    end
     AgentObjectiveLandscape(; objectives=objectives, f_types=f_access)
 end
 
@@ -184,7 +195,7 @@ end
 
 time_till_completion_obj(s::KAgentState, urgency::Float64) = Any[- urgency * length(s.hist), missing]
 
-"""Goal-avoidance behavior. Takes a vector of obstacle descriptors.
+"""STRICT Goal-avoidance behavior. Takes a vector of obstacle descriptors.
 
 Currently computes the "risk" of the agent in approaching an obstacle.
 
@@ -211,6 +222,28 @@ function safety_obj(s::KAgentState, obstacles::Vector)
     end
 end
 
+"""WEAK Goal-avoidance behavior. Takes a vector of obstacle descriptors.
+
+Currently computes the "risk" of the agent in approaching an obstacle.
+
+Each component of the vector is a dictionary holding two objects:
+* :poly   => The vector of tuple-coordinates that represent the polygon. Must be closed!
+* :risk   => The "risk"-scaling factor; scales the shortest distance between a point and obstacle.
+* :impact => The amount by which an agent is penalized for entering an obstacle.
+
+ex: Dict(:poly => [(0.,0.), (0., 1.), (1., 1.), (1., 0.), (0., 0.)], :risk => 10.)
+"""
+function risk_obj(s::KAgentState, obstacles::Vector)
+    let x = Tuple(s.x), total_risk = 0, collided = missing
+        for obstacle in obstacles
+            obc_pgon = GI.Polygon([obstacle[:poly]])
+            dist = norm(x .- GO.centroid(obc_pgon))
+            total_risk += obstacle[:impact] * exp(-dist^2 / obstacle[:risk])
+        end
+        return [-total_risk, collided]
+    end
+end
+
 combined_reward(r::Vector) = mapreduce(c->c[1], +, r)
 # combined_termination_check(b::BitVector) = any(b) & all(b)
 combined_termination_check(b::BitVector) = any(b)
@@ -225,7 +258,8 @@ function obj_from_landscape(objs::AgentObjectiveLandscape; digits=2)
     fs = map(objs.objectives) do obj
         @match obj[1] begin
             :goal => s->line_to_target_obj(s, obj[2])
-            :obc  => s->safety_obj(s, obj[2])
+            :sobc  => s->safety_obj(s, obj[2])
+            :robc  => s->risk_obj(s, obj[2])
             :horz => s->time_till_completion_obj(s, obj[2])
         end
     end
@@ -235,7 +269,8 @@ end
 function obcs_from_landscape(objs::AgentObjectiveLandscape)
     obcs = map(objs.objectives) do obj
         @match obj[1] begin
-            :obc => obj[2]
+            :sobc => obj[2]
+            :robc => obj[2]
             _    => nothing
         end
     end

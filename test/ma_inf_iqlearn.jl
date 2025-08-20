@@ -26,6 +26,13 @@ using Flux # Going to add this in now to start forming the networks
 # Agent 1: :ag1
 # Agent 2: :ag2
 
+# since copy(::MCTSSolver) isn't defined for some reason, just use this instead of figuring out a copy extension
+base_solver() = MCTSSolver(n_iterations=1000, depth=20, exploration_constant=10.0)
+
+# Sloppy way to force a point within the dimensions (truncate coordinates along both axes to be within dim limits)
+minmax_to_dims(x, dims::Tuple; tol=1e-5) = min(max(x, dims[1]+tol), dims[2]-tol)
+constrain_to_dims(p::Tuple, dims::Tuple; tol=1e-5) = [minmax_to_dims(p[1], dims; tol=tol), minmax_to_dims(p[2], dims; tol=tol)]
+
 """Randomly generates obstacles distributed throughout space.
 
 No checking if it overlaps with goal points, on purpose.
@@ -63,6 +70,7 @@ function obcs_gen(flist::Vector{Symbol}, num_obcs::Integer, dims::Tuple;
             corner_vecs = [[radius[i] * cos(angles[i]), radius[i] * sin(angles[i])] for i in 1:4] # convert to cartesian vectors
             corners = [Tuple(physical_center .+ corner_vecs[i]) for i in 1:4] # determine Tuple cartesian coordinates for corners
             corners = map(v->round.(v, digits=2), corners) # clean up slightly so we avoid nasty issues with floating point precision
+            corners = map(v->constrain_to_dims(v, dims), corners) # imperfect way of ensuring obstacles stay in-bounds
             push!(corners, corners[1]) # need to close off the geometry by repeating the first point
 
             relevant_feature_mask = rand(Bool, (length(unfilled_ftypes),)) # determine which features this obstacle is relevant to
@@ -127,7 +135,7 @@ end
 function init_world(dims::Tuple=(0., 10.), flist::Vector{Symbol}=[:aer, :surf, :sub]; num_obcs::Integer=5, num_goals::Integer=3)
     obcs = obcs_gen(flist, num_obcs, dims)
     goals = goal_gen(flist, num_goals, dims)
-    urgency = [(:ag1, 1.5), (:ag2, 0.5), (:ag3, 1.5)]
+    urgency = [(:a1, 1.5), (:a2, 1.0), (:a3, 0.5)]
 
     # Define global objective landscape
     globj_scape = GlobalObjectiveLandscape(; goals=goals, obstacles=obcs, horizons=urgency)
@@ -141,7 +149,7 @@ function init_world(dims::Tuple=(0., 10.), flist::Vector{Symbol}=[:aer, :surf, :
     end
 
     # Define world to hold all agents
-    solver = MCTSSolver(n_iterations=1000, depth=20, exploration_constant=10.0)
+    solver = base_solver()
     # solver = DPWSolver(n_iterations=1000, depth=20, exploration_constant=1.0)
     kworld = create_kworld(; solver=solver, dims=dims, gobj=globj_scape, menv=menv)
 
@@ -153,7 +161,8 @@ function init_agent(kworld::KWorld, name::String="ag1";
                     w::Float64=0., v::Float64=0.)
     if isnothing(start)
         let dims=kworld.dimensions
-            start = (rand(1:(Integer(floor((dims[2] - dims[1])/0.5) + 1)), (1,2)) .- 1.) .* 0.5 .+ dims[1]
+            # sub-sample from 1 -> 19 (where 0 and 20 represent dimension bounds), then transform back to dimension-appropriate values
+            start = (rand(1:(Integer(floor((dims[2] - dims[1])/0.5) - 1)), (1,2))) .* 0.5 .+ dims[1]
         end
     end
     ag_params = Dict(:name  => name,
@@ -161,67 +170,78 @@ function init_agent(kworld::KWorld, name::String="ag1";
                     :flist => copy(ag_flist),
                     :elist => copy(ag_envs),
                     :w => w, :v => v) # no noise for our simple buddy
-    add_agent_to_world(kworld, ag_params)
+    add_agent_to_world(kworld, ag_params; add_safely=false)
     ag_mdp = kworld.inhabitants[name]
     ag_bup = KAgentBeliefUpdater(state_dims=length(ag_params[:start]), env_dims=length(ag_envs))
 
-    return ag_mdp, ag_bup
+    # prevent us from crafting an agent that is immediately done (avoid trivial MDPs)
+    if isterminal(ag_mdp, rand(initialstate(ag_mdp)))
+        # do not keep the start value if provided! It evidently does not work with this problem construction
+        delete!(kworld.inhabitants, kworld.inhabitants[name])
+        return init_agent(kworld, name; ag_flist=ag_flist, ag_envs=ag_envs, start=nothing, w=w, v=v)
+    else
+        return ag_mdp, ag_bup
+    end
 end
 
-function main(dims::Tuple=(0., 10.); num_obcs::Integer=5, num_goals::Integer=3)
-    kworld = init_world((0., 10.), [:aer, :surf, :sub]; num_obcs=5, num_goals=3)
-    ag1_mdp, ag1_bup = init_agent(kworld, "ag1"; ag_flist=[:sub, :surf, :ag1], ag_envs=[:sin, :exp])
-    ag2_mdp, ag2_bup = init_agent(kworld, "ag2"; ag_flist=[:surf, :aer, :ag2], ag_envs=[:exp, :lin])
-    ag3_mdp, ag3_bup = init_agent(kworld, "ag3"; ag_flist=[:sub, :ag3], ag_envs=[:sin, :lin])
+function gen_experience(kworld::KWorld, name::String, ag_flist::Vector{Symbol}, num_instances::Integer=10;
+                        num_obcs::Integer=5, num_goals::Integer=3, max_steps=30, sim_thresh=15, update_progress=false, updater_offset=1)
+    experiences = []
+    generate_showvalues(sn) = () -> [("Instance #", sn)]
+    updater = Progress(num_instances; desc="Simulating instances of agent: $(name)...", offset=updater_offset)
+    for k in 1:num_instances
+        ag_mdp, ag_bup = init_agent(kworld, name*"_"*string(k); ag_flist=ag_flist, ag_envs=[:sin, :exp])
+        solver = BeliefMCTSSolver(base_solver(), ag_bup)
 
-    return kworld
+        planner = solve(solver, ag_mdp)
+        obs_dims = state_space(ag_mdp).dims[1]
+
+        data = expert_simulator(ag_mdp, planner, ag_bup;
+                                max_steps=max_steps, sim_limit=sim_thresh, obs_dims=obs_dims,
+                                update_progress=update_progress, updater_offset=updater_offset+2)
+        next!(updater; showvalues=generate_showvalues(k))
+
+        anonymized_location_data = deepcopy(data)
+        anonymized_location_data[:s][1:2, :] = zeros(size(data[:s][1:2,:]))
+        push!(experiences, (ExperienceBuffer(data, max_steps, 1, Array{Int64}[], nothing, 0),
+                            ExperienceBuffer(anonymized_location_data, max_steps, 1, Array{Int64}[], nothing, 0)))
+    end
+
+    return experiences
 end
 
-function main(; plot_traces=false)
-    obcs = let obcs = [];
-        push!(obcs, (:sub, Dict(:poly => [(0., 0.), (0., 0.5), (0.4, 0.3), (0.5, 0.), (0., 0.)], :risk => 10., :impact => 10.)));
-        push!(obcs, (:sub, Dict(:poly => [(4., 4.5), (5., 4.5), (7., 5.), (2., 5.), (4., 4.5)], :risk => 10., :impact => 10.)));
-    end
-    goals = [
-        (:aer, Dict(:target=>[9.5 9.5], :strength=>10., :influence=>5., :size=>0.75)),
-        (:surf, Dict(:target=>[8.5 8.5], :strength=>10., :influence=>5., :size=>0.75)),
-        (:sub, Dict(:target=>[7.5 9.5], :strength=>10., :influence=>5., :size=>0.75))
-    ]
-    urgency = [(:ag1, 1.5), (:ag2, 0.5)]
-
-    # Define global objective landscape
-    globj_scape = GlobalObjectiveLandscape(; goals=goals, obstacles=obcs, horizons=urgency)
-
-    # define global environment
-    menv = let μfs = [(:sin, x->sin(x[1]) + cos(x[2])),
-                    (:exp, x->100*exp(-norm(x-[8 8.])^2 / 1.)),
-                    (:lin, x->x[1]^2 + x[2])],
-            μs = [:sin, :exp, :lin];
-        MuEnv(3, μs, Dict(μfs));
-    end
-
-    # Define world to hold all agents
-    solver = MCTSSolver(n_iterations=1000, depth=20, exploration_constant=10.0)
-    # solver = DPWSolver(n_iterations=1000, depth=20, exploration_constant=1.0)
+function main(; max_steps=30, sim_thresh=15, num_instances=10, plot_traces=false)
     dims = (0., 10.)
-    kworld = create_kworld(; solver=solver, dims=dims, gobj=globj_scape, menv=menv)
+    # kworld, agent_mdps, agent_beliefs = construct_problem(dims; num_goals=1)
+    kworld = init_world((0., 10.), [:sub, :surf, :aer]; num_obcs=5, num_goals=3)
+    # sim_trace1 = stepthrough_sim(ag1_mdp, planner1, ag1_bup, 15; plot_sim_trace=plot_traces);
 
-    ag1_flist = [:sub, :surf, :ag1]
-    ag1_envs = [:sin, :exp]
-    ag1_params = Dict(:name  => "ag1",
-                    :start => [3. 3.],
-                    :flist => ag1_flist,
-                    :elist => ag1_envs,
-                    :w => 0., :v => 0.) # no noise for our simple buddy
-    add_agent_to_world(kworld, ag1_params)
-    ag1_mdp = kworld.inhabitants["ag1"]
-    ag1_bup = KAgentBeliefUpdater(state_dims=length(ag1_params[:start]), env_dims=length(ag1_envs))
-    solver1 = BeliefMCTSSolver(solver, ag1_bup)
-    planner1 = solve(solver1, ag1_mdp)
-    sim_trace1 = stepthrough_sim(ag1_mdp, planner1, ag1_bup, 15; plot_sim_trace=plot_traces);
+    ag_flists = Dict("ag1" => [:sub, :a1],
+                     "ag2" => [:surf, :a1],
+                     "ag3" => [:aer, :a1],
+                     "ag4" => [:sub, :surf, :a1],
+                     "ag5" => [:surf, :aer, :a1],
+                     "ag6" => [:sub, :aer, :a1],
+                     "ag7" => [:sub, :surf, :aer, :a1])
 
-    return obcs, goals, urgency, globj_scape, menv, solver, dims, kworld, ag1_flist, ag1_envs, ag1_params, ag1_mdp, ag1_bup, solver1, planner1, sim_trace1
+    data = Dict()
+    generate_showvalues(sn) = () -> [("Agent #", sn)]
+    updater = Progress(length(ag_flists); desc="Generating expert data...", offset=1)
+    for (i, p) in enumerate(ag_flists)
+        data[p[1]] = gen_experience(kworld, p[1], p[2], num_instances; max_steps=max_steps, sim_thresh=sim_thresh, updater_offset=3)
+        next!(updater, showvalues=generate_showvalues(i))
+        if i > 3; break; end
+    end
+
+    println("\n"^(1+2*4))
+    return kworld, data
+
+    # data = Dict([(k, gen_experience(kworld, agent_mdps[k], agent_beliefs[k]; max_steps=max_steps, sim_thresh=sim_thresh)) for k in keys(agent_mdps)])
+
+    # return kworld, agent_mdps, agent_beliefs, data
 end
+
+kworld, data = main(; max_steps=30, num_instances=3)
 
 function get_experience_data(;max_steps=10000, sim_thresh=15, update_progress=false)
     obcs = let obcs = [];
@@ -262,12 +282,13 @@ function get_experience_data(;max_steps=10000, sim_thresh=15, update_progress=fa
     add_agent_to_world(kworld, ag1_params)
     ag1_mdp = kworld.inhabitants["ag1"]
     ag1_bup = KAgentBeliefUpdater(state_dims=length(ag1_params[:start]), env_dims=length(ag1_envs))
+    obs_dims = state_space(ag1_mdp).dims[1]
     solver1 = BeliefMCTSSolver(solver, ag1_bup)
 
     prog = ProgressUnknown(desc="Constructing MCTS policy tree..."; spinner=true)
     planner1 = solve(solver1, ag1_mdp)
 
-    data = expert_simulator(ag1_mdp, planner1, ag1_bup; max_steps=max_steps, sim_limit=sim_thresh, update_progress=update_progress)
+    data = expert_simulator(ag1_mdp, planner1, ag1_bup; max_steps=max_steps, sim_limit=sim_thresh, update_progress=update_progress, obs_dims=obs_dims)
 
     anonymized_location_data = deepcopy(data)
     anonymized_location_data[:s][1:2, :] = zeros(size(data[:s][1:2,:]))

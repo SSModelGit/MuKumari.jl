@@ -54,8 +54,8 @@ POMDPs.isterminal(pomdp::KAgentPOMDP, s::KAgentState) = pomdp.obj(s)[2]
 
 POMDPs.initialstate(pomdp::KAgentPOMDP) = Deterministic(blindstart_KAgentState(pomdp, pomdp.start))
 
-nearest_obstacles(pomdp::KAgentPOMDP, s) = nearest_k_geometries(s.x, pomdp.obcs, 5) |> Iterators.flatten |> collect |> Iterators.flatten |> collect
-nearest_goals(pomdp::KAgentPOMDP, s) = nearest_k_geometries(s.x, pomdp.goals, 3) |> Iterators.flatten |> collect |> Iterators.flatten |> collect
+nearest_obstacles(pomdp::KAgentPOMDP, s; k=2) = nearest_k_geometries(s.x, pomdp.obcs, k) |> Iterators.flatten |> collect |> Iterators.flatten |> collect
+nearest_goals(pomdp::KAgentPOMDP, s; k=1) = nearest_k_geometries(s.x, pomdp.goals, k) |> Iterators.flatten |> collect |> Iterators.flatten |> collect
 
 # POMDPs.initialobs(pomdp::KAgentPOMDP, s) = Deterministic([state(s)..., z(s)..., t(s)])
 POMDPs.initialobs(pomdp::KAgentPOMDP, s) = Deterministic([state(s)..., z(s)..., nearest_obstacles(pomdp, s)..., nearest_goals(pomdp, s)..., t(s)])
@@ -84,7 +84,7 @@ action_heading_assoc_kagent = Dict([(:n,  normalize([ 0,  1])),
                                     (:nw, normalize([-1,  1])),
                                     (:c,  [0., 0.])])
 
-shape_state_as_obs(pomdp::KAgentPOMDP, s::KAgentState) = [state(s)..., z(s)...,t(s)...]
+shape_state_as_obs(pomdp::KAgentPOMDP, s::KAgentState) = [state(s)..., z(s)..., nearest_obstacles(pomdp, s)..., nearest_goals(pomdp, s)..., t(s)...]
 
 function POMDPs.gen(pomdp::KAgentPOMDP, s::KAgentState, a::Symbol, rng)
     # add noise to the action taken (both in direction and speed)
@@ -92,7 +92,9 @@ function POMDPs.gen(pomdp::KAgentPOMDP, s::KAgentState, a::Symbol, rng)
     # propagate next location
     xp = @. s.x + real_a * pomdp.s
     # adjust for any collision
-    xp = collision_check(s.x, xp, pomdp.world, pomdp.width; debug=false, digits=pomdp.digits)
+    if any(isnan.(xp)); println("xp: ", xp); println("x: ", s.x); end
+    xp = risk_check(s.x, xp, pomdp.world, pomdp.width; debug=false, digits=pomdp.digits)
+    if any(isnan.(xp)); println("Risk-evaluated xp: ", xp); println("x: ", s.x); end
     # make an observation vector for next location
     zp = push!(copy(s.z), predict_env(pomdp.menv, xp))
     # update the next timestep's history

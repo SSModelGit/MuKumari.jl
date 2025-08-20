@@ -64,13 +64,13 @@ function add_agent_to_world(;
                             ag_flist::Vector, ag_sensor_list::Vector,
                             dimensions::Union{Tuple, Nothing}=nothing, digits::Integer=3, mdp_horizon_discount::Float64=0.95,
                             agent_width::Float64=0.1, agent_speed::Float64=1., ag_mvt_noise::Float64=0.05,
-                            obs_noise::Float64=0.05)
+                            obs_noise::Float64=0.05, suppress_warnings::Bool=false)
     if isnothing(dimensions)
         dimensions = kworld.dimensions
     end
     ag_menv = tangle_agent_env(kworld.menv, ag_sensor_list)
     ag_landscape = tangle_agent_landscape(kworld.glob_landscape, ag_flist)
-    @info "Currently initializing a KAgentPOMDP! Capacity to instead add a KAgentMDP still unaddressed."
+    if !suppress_warnings; @info "Currently initializing a KAgentPOMDP! Capacity to instead add a KAgentMDP still unaddressed."; end
     agent_mdp = init_standard_KAgentPOMDP(name=name, start=start_pos,
                                           dimensions=dimensions, objl=ag_landscape, menv=ag_menv,
                                           digits=digits, mdp_horizon_discount=mdp_horizon_discount,
@@ -115,7 +115,7 @@ function add_agent_to_world(kworld::KWorld, agent_params::Dict; add_safely::Bool
                        ag_flist=agent_params[:flist], ag_sensor_list=agent_params[:elist],
                        dimensions=dims, digits=digits, mdp_horizon_discount=mdp_horizon_discount,
                        agent_width=agent_width, agent_speed=agent_speed, ag_mvt_noise=ag_mvt_noise,
-                       obs_noise=obs_noise)
+                       obs_noise=obs_noise, suppress_warnings=!add_safely)
 end
 
 """Populate world with a list of agents at once.

@@ -88,7 +88,8 @@ Will produce a dictionary with the following fields:
 * :done => Boolean Matrix of terminal status; 1 row per column; true if reached terminal state; false otherwise
 """
 function expert_simulator(pomdp::KAgentPOMDP, planner::AbstractMCTSPlanner, bup::KAgentBeliefUpdater;
-                          max_steps=10000, sim_limit=15, update_progress=false)
+                          max_steps=10000, sim_limit=15, obs_dims::Union{Nothing, Integer}=nothing,
+                          update_progress=false, updater_offset=1)
     step_counter = 1 # this is used to index arrays; use one-indexing
     sim_counter = 0 # used to track number of sims taken; use zero-indexing
 
@@ -98,9 +99,11 @@ function expert_simulator(pomdp::KAgentPOMDP, planner::AbstractMCTSPlanner, bup:
     a_list = Matrix{Bool}(undef, a_dims, max_steps)
 
     # Prep state saving
-    obs_dims = bup.state_dims + bup.env_dims + 1
-    s_list = Matrix{Float64}(undef, obs_dims, max_steps)
-    sp_list = Matrix{Float64}(undef, obs_dims, max_steps)
+    if isnothing(obs_dims); obs_dims = bup.state_dims + bup.env_dims + 1; end
+    # s_list = Matrix{Float64}(undef, obs_dims, max_steps)
+    # sp_list = Matrix{Float64}(undef, obs_dims, max_steps)
+    s_list = zeros(Float64, obs_dims, max_steps)
+    sp_list = zeros(Float64, obs_dims, max_steps)
 
     # additional list prep
     expert_val_list = ones(Float32,1,max_steps)
@@ -109,15 +112,16 @@ function expert_simulator(pomdp::KAgentPOMDP, planner::AbstractMCTSPlanner, bup:
     done_list = Matrix{Bool}(undef, 1, max_steps)
 
     single_trace = []
+    broke = false
     if !update_progress;
-        p1 = Progress(max_steps; desc="Simulating expert behavior...", offset=1);
+        p1 = Progress(max_steps; desc="Simulating expert behavior...", offset=updater_offset);
         generate_showvalues(sn) = () -> [("Step number", sn)]
     end
     while step_counter ≤ max_steps
         sim_counter += 1
         single_trace = empty!(single_trace)
         step = 0
-        if !update_progress; p2 = Progress(sim_limit; desc="Simulation #$(sim_counter)...", offset=3); end
+        if !update_progress; p2 = Progress(sim_limit; desc="Simulation #$(sim_counter)...", offset=updater_offset+2); end
         for (b,s,sp,a,o,r) in stepthrough(pomdp, planner, bup, "b,s,sp,a,o,r", max_steps=sim_limit)
             step += 1
             push!(single_trace, [s,sp,a,one1(a),r,step,POMDPs.isterminal(pomdp, sp)])
