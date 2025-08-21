@@ -349,8 +349,6 @@ function main(; max_steps=30, sim_thresh=15, num_instances=10, plot_traces=false
     # return kworld, agent_mdps, agent_beliefs, data
 end
 
-kworld, data = main(; max_steps=30, num_instances=3)
-
 function get_experience_data(;max_steps=10000, sim_thresh=15, update_progress=false)
     obcs = let obcs = [];
         push!(obcs, (:sub, Dict(:poly => [(0., 0.), (0., 0.5), (0.4, 0.3), (0.5, 0.), (0., 0.)], :risk => 10., :impact => 10.)));

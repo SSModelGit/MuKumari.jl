@@ -114,7 +114,7 @@ function expert_simulator(pomdp::KAgentPOMDP, planner::AbstractMCTSPlanner, bup:
     single_trace = []
     broke = false
     if !debug_progress;
-        p1 = Progress(max_steps; desc="Simulating expert behavior...", offset=updater_offset);
+        p1 = Progress(max_steps; desc="Collecting behavior data...", offset=updater_offset);
         generate_showvalues(sn) = () -> [("Step number", sn)]
     end
     while step_counter ≤ max_steps
