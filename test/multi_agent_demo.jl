@@ -4,7 +4,8 @@ using LinearAlgebra: norm, normalize
 
 using POMDPTools, MCTS, POMDPLinter
 
-using CairoMakie
+# Commenting out CairoMakie due to current issue compiling with Plots and GR_jll
+# using CairoMakie
 using JLD2: save, load
 
 ## Environment Feature types:
