@@ -407,7 +407,7 @@ end
 # # use BSON loader otherwise
 # kworld, exp_data, exp_data_anon = get_experience_data(;max_steps=30, sim_thresh=20, update_progress=false)
 
-# mdp = kworld.inhabitants["ag1"]
+# mdp = get_agent(kworld, "ag1")
 
 # as = actions(mdp)
 # S = state_space(mdp)

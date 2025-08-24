@@ -1,4 +1,4 @@
-export KWorld, create_kworld, add_agent_to_world, get_num_agents
+export KWorld, create_kworld, add_agent_to_world, get_num_agents, get_agent
 
 @with_kw_noshow struct KWorld
     solver::Union{MCTSSolver, DPWSolver} # Untyped to allow for a broad array of possible types
@@ -125,3 +125,5 @@ populate_world(kworld::KWorld, kagents::Vector{T}) where T <: Union{KAgentMDP, K
 """Get total number of agents.
 """
 get_num_agents(kworld::KWorld) = length(kworld.inhabitants)
+
+get_agent(kworld::KWorld, name::String) = kworld.inhabitants[name]
