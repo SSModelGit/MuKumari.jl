@@ -3,6 +3,7 @@ using MuKumari
 using LinearAlgebra: norm, normalize
 
 using POMDPTools, MCTS, POMDPLinter
+using Match: @match
 
 # addressing weird load order bugs
 using Plots
