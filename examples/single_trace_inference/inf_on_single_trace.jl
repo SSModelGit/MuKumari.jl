@@ -87,8 +87,17 @@ function quick_policy_compute_for_objl(pomdp::KAgentPOMDP; solver_type::Symbol=:
     return 𝒮_base
 end
 
-function evaluate_proposed_objectives(pomdp::KAgentPOMDP, 𝒮_proposed, 𝒮_infer)
+function evaluate_proposed_objectives(pomdp::KAgentPOMDP, π_proposed, π_infer, data::ExperienceBuffer)
     # use equation (6) from the VAE paper Structural Relational Inference Actor-Critic for Multi-Agent Reinforcement Learning (Zhang et. al.)
+
+    # standard mechanism to evaluate
+    let s = rand(initialstate(pomdp)), o = rand(initialobs(pomdp, s)), a = Flux.onehot(:nw, actions(pomdp))
+        action(π_infer, o) # fully unnecessary to construct this, just doing this for example's sake
+        Crux.value(π_proposed, o, a) # use the observation to produce this
+        Crux.value(π_proposed, MuKumari.shape_state_as_obs(pomdp, s), a) # alternatively, use the internal func`shape_state_as_obs` function on a state directly
+        j = 1
+        Crux.value(π_infer, data.data[:s][:,j], data.data[:a][:,j]) # OR evaluate on a timestep drawn from of the ExperienceBuffer (at time = j)
+    end
 end
 
 function quick_IQL(kworld::KWorld, anon_data::ExperienceBuffer; plot_metrics::Bool=false)
