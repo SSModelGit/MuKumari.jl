@@ -2,3 +2,4 @@
 test/Manifest.toml
 .vscode/
 test/poetry.lock
+MuKumari-base.code-workspace
