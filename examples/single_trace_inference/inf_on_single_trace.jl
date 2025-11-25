@@ -90,6 +90,24 @@ end
 function evaluate_proposed_objectives(pomdp::KAgentPOMDP, π_proposed, π_infer, data::ExperienceBuffer)
     # use equation (6) from the VAE paper Structural Relational Inference Actor-Critic for Multi-Agent Reinforcement Learning (Zhang et. al.)
 
+    # three eval types
+    # NOTE: q(z|o) refers to likelihood of underlying feature (z) w.r.t. observations (o)
+    ## Here, z is the proposed objective set, and o is the timeseries of observed actions
+    ## We can define q(z|o) approximately as the proposal distribution
+    # NOTE: -H(q(z|o)): sum of the negative log likelihoods of each of the objectives in the proposed objective set, using the proposal distribution
+    ## Compute as: ∑_{z_i∈z}q(z_i|o)*log(q(z_i|o))
+
+    # Type 1: E_q[log(p(o|z))]
+    ## approximately equivalent to the Open-ended SIPS approach of P(g|π,o)/Q(g) (error of reconstruction to true obs weighted by likelihood of reconstruction)
+    ### Approximate E_q[p(o|z)] as (∑π(a_true) ∀ a ∈ [set of observations]) * q(z|o)
+    ### This is an adaptation of the Open-ended SIPS approach
+
+    # Type 2: -H(q(z|o)) - E_q[log(p(o|z))]
+    ## The combination of Open-ended SIPS with the L_VAE from SRI-AC
+
+    # Type 3: -H(q(z|o)) - E_q[log(p_iq(o|z))]: Using IQLearn's output as a softer, smoothened, broader point of comparison, instead of directly against data
+    ## 
+
     # standard mechanism to evaluate
     let s = rand(initialstate(pomdp)), o = rand(initialobs(pomdp, s)), a = Flux.onehot(:nw, actions(pomdp))
         action(π_infer, o) # fully unnecessary to construct this, just doing this for example's sake
