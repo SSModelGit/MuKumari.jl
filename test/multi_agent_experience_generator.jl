@@ -371,10 +371,10 @@ function get_experience_data(;max_steps=10000, sim_thresh=15, update_progress=fa
 
     # define global environment
     menv = let μfs = [(:sin, x->sin(x[1]) + cos(x[2])),
-                    (:exp, x->100*exp(-norm(x-[8 8.])^2 / 1.)),
-                    (:lin, x->x[1]^2 + x[2])],
-            μs = [:sin, :exp, :lin];
-        MuEnv(3, μs, Dict(μfs));
+                      (:exp, x->100*exp(-norm(x-[8 8.])^2 / 1.)),
+                      (:lin, x->x[1]^2 + x[2])],
+               μs = [:sin, :exp, :lin];
+               MuEnv(3, μs, Dict(μfs));
     end
 
     # Define world to hold all agents

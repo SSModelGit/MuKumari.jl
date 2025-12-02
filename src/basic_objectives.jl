@@ -107,7 +107,10 @@ struct GlobalObjectiveLandscape <: AbstractObjectiveLandscape
                              risk_acceptance::Bool) = new(goals, obstacles, horizons, feature_list, risk_acceptance)
 end
 
-"""Keyword-based constructor for the global landscape.
+"""
+    GlobalObjectiveLandscape(; goals::Vector, obstacles::Vector, horizons::Vector, risk_acceptance::Bool=true)
+
+Keyword-based constructor for the global landscape.
 
 Automatically constructs the feature list.
 """

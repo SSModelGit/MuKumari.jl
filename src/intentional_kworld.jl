@@ -1,7 +1,7 @@
 export KWorld, create_kworld, add_agent_to_world, get_num_agents, get_agent
 
 @with_kw_noshow struct KWorld
-    solver::Union{MCTSSolver, DPWSolver} # Untyped to allow for a broad array of possible types
+    solver::Union{MCTSSolver, DPWSolver, Nothing}
     dimensions::Tuple # Dimensions of 2D-world
     inhabitants::Dict{String, T} where T <: Union{KAgentMDP, KAgentPOMDP} = Dict{String, KAgentPOMDP}() # Dictionary of agents operating in this world
     menv::MuEnv # Global environment of the world

@@ -68,7 +68,10 @@ function solver_from_type(pomdp::KAgentPOMDP, type::Symbol=:dpw; solver_params)
 end
 
 function deep_q_metrics(pomdp::KAgentPOMDP, 𝒮_net; solver_type::Symbol=:all)
-    @time π_net = map(x->solve(x, pomdp), 𝒮_net)
+    @time π_net = @match solver_type begin
+        :all => map(x->solve(x, pomdp), 𝒮_net)
+        _    => solve(𝒮_net, pomdp)
+    end
     labels = @match solver_type begin
         :all => ["REINFORCE", "DQN", "SoftQ" ]
         :reinforce => ["REINFORCE"]
@@ -119,21 +122,6 @@ function evaluate_proposed_objective(pomdp::KAgentPOMDP, π_proposed, π_infer, 
     end
 end
 
-function construct_q_proposals(base_objs)
-    k = length(base_objs)
-    q_base = Dict([(obj, 1/k) for obj in base_objs])
-    q_objs = map(powerset(base_objs, 1)) do obj
-        q_obj = 1
-        for comp_obj in obj
-            q_obj *= q_base[comp_obj]
-        end
-        (obj, q_obj)
-    end |> Dict
-    q_norm = sum(values(q_objs))
-    for obj in q_objs; q_objs[obj] /= q_norm; end
-    q_objs
-end
-
 function quick_IQL(kworld::KWorld, anon_data::ExperienceBuffer; plot_metrics::Bool=false)
     N = anon_data.elements
     mdp = get_agent(kworld, "ag1")
@@ -151,6 +139,59 @@ function quick_IQL(kworld::KWorld, anon_data::ExperienceBuffer; plot_metrics::Bo
     return 𝒟_iql, mdp, f
 end
 
+function kworld_for_inference(possible_goals::Vector;
+                                known_kworld::Union{KWorld, Nothing}=nothing,
+                                known_obcs::Union{Vector, Nothing}=nothing,
+                                known_env::Union{MuEnv, Nothing}=nothing, dims::Union{Tuple, Nothing}=nothing)
+    if !isnothing(known_kworld)
+        known_env = known_kworld.menv
+        known_obcs = copy(known_kworld.glob_landscape.obstacles)
+        dims = kworld.dimensions
+    elseif isnothing(known_kworld) && (isnothing(known_obcs) && isnothing(known_env) && isnothing(dims))
+        @error "Have to specify EITHER a known world OR known obstacles & environment & dimensions (world will take precedent)"
+    end
+
+    infer_glob_landscape = GlobalObjectiveLandscape(; goals=possible_goals, obstacles=known_obcs, horizons=[])
+    println("Global Objective is: ", infer_glob_landscape)
+    pseudo_solver = MCTSSolver(n_iterations=1000, depth=20, exploration_constant=10.0) # random default solver to fill in required fields of KWorld
+    create_kworld(; solver=pseudo_solver, dims=dims, gobj=infer_glob_landscape, menv=known_env)
+end
+
+function construct_q_proposals(infer_kworld; inf_agent_start::Matrix=[3. 3.])
+    base_objs = copy(infer_kworld.glob_landscape.goals)
+    k = length(base_objs)
+    base_obj_names = map(x->x[1], base_objs)
+
+    q_base = Dict([(obj, 1/k) for obj in base_obj_names])
+    q_objs = map(powerset(base_obj_names, 1)) do obj
+        q_obj = 1
+        for comp_obj in obj
+            q_obj *= q_base[comp_obj]
+        end
+        (obj, q_obj)
+    end |> Dict
+    q_norm = sum(values(q_objs))
+    for obj in keys(q_objs); q_objs[obj] /= q_norm; end
+
+    name_to_obj_comp_list = map(enumerate(powerset(base_obj_names, 1))) do (i, p_name)
+        ("p"*string(i), p_name)
+    end |> Dict
+    # name_to_obj_comp_list = Dict([(Symbol("p"*i), obj) for (i, obj) in enumerate(keys(q_objs))])
+    proposal_names = collect(keys(name_to_obj_comp_list))
+    name_to_q_proposal = Dict([(name, q_objs[name_to_obj_comp_list[name]]) for name in proposal_names])
+
+    obc_names = collect(Set(map(x->x[1], infer_kworld.glob_landscape.obstacles)))
+    name_to_proposed_mdp = map(enumerate(name_to_obj_comp_list)) do (i, np)
+        add_agent_to_world(infer_kworld, Dict(:name  => string(np[1]),
+                                              :start => copy(inf_agent_start),
+                                              :flist => vcat(np[2], obc_names),
+                                              :elist => copy(infer_kworld.menv.μ_order),
+                                              :w => 0., :v => 0.))
+        (np[1], infer_kworld.inhabitants[string(np[1])])
+    end |> Dict
+    return proposal_names, name_to_obj_comp_list, name_to_q_proposal, name_to_proposed_mdp
+end
+
 println("Directory is: ", @__DIR__)
 
 script_dir = @__DIR__
@@ -160,7 +201,8 @@ anon_data.elements = 996 # manual edit of this specific data file to account for
 
 𝒟_iql, mdp, f = quick_IQL(kworld, anon_data; plot_metrics=false)
 
-𝒮_dqn_metric_net = deep_q_solver(mdp; solver_params=[:all, 10000])
-π_dqn_metric_net, p_dqn_metrics = deep_q_metrics(mdp, 𝒮_dqn_metric_net; solver_type=:all)
+# forward_estim_solver = :softq
+# 𝒮_dqn_metric_net = deep_q_solver(mdp; solver_params=[forward_estim_solver, 10000])
+# π_dqn_metric_net, p_dqn_metrics = deep_q_metrics(mdp, 𝒮_dqn_metric_net; solver_type=forward_estim_solver)
 
 # The means of evaluating the Q function is to use the `Crux.value` function
