@@ -1,6 +1,7 @@
 using MuKumari
 
 using LinearAlgebra: norm, normalize
+using Combinatorics: powerset
 
 using POMDPTools, MCTS, POMDPLinter
 using Match: @match
@@ -87,7 +88,7 @@ function quick_policy_compute_for_objl(pomdp::KAgentPOMDP; solver_type::Symbol=:
     return 𝒮_base
 end
 
-function evaluate_proposed_objectives(pomdp::KAgentPOMDP, π_proposed, π_infer, data::ExperienceBuffer)
+function evaluate_proposed_objective(pomdp::KAgentPOMDP, π_proposed, π_infer, data::ExperienceBuffer, q_objectives)
     # use equation (6) from the VAE paper Structural Relational Inference Actor-Critic for Multi-Agent Reinforcement Learning (Zhang et. al.)
 
     # three eval types
@@ -116,6 +117,21 @@ function evaluate_proposed_objectives(pomdp::KAgentPOMDP, π_proposed, π_infer,
         j = 1
         Crux.value(π_infer, data.data[:s][:,j], data.data[:a][:,j]) # OR evaluate on a timestep drawn from of the ExperienceBuffer (at time = j)
     end
+end
+
+function construct_q_proposals(base_objs)
+    k = length(base_objs)
+    q_base = Dict([(obj, 1/k) for obj in base_objs])
+    q_objs = map(powerset(base_objs, 1)) do obj
+        q_obj = 1
+        for comp_obj in obj
+            q_obj *= q_base[comp_obj]
+        end
+        (obj, q_obj)
+    end |> Dict
+    q_norm = sum(values(q_objs))
+    for obj in q_objs; q_objs[obj] /= q_norm; end
+    q_objs
 end
 
 function quick_IQL(kworld::KWorld, anon_data::ExperienceBuffer; plot_metrics::Bool=false)
