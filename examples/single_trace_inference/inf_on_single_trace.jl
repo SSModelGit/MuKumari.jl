@@ -16,9 +16,15 @@ using CUDA, cuDNN
 # Make sure to load Plots before Crux, because of some weird load order bug
 using Crux
 
+# Utilizing Gen for generative approach to particle filters
+using Gen: @gen, Distribution, logpdf, random, categorical
+using Gen: ParticleFilterState, initialize_particle_filter, particle_filter_step!, maybe_resample!, get_traces, get_retval
+
+# Save data
 using JLD2: @save, @load
 using BSON
 
+# Core of deepnet structure
 using Flux
 
 # construct a belief state out of the mdp parameters
@@ -84,42 +90,10 @@ function deep_q_metrics(pomdp::KAgentPOMDP, 𝒮_net; solver_type::Symbol=:all)
     return π_net, p
 end
 
-function quick_policy_compute_for_objl(pomdp::KAgentPOMDP; solver_type::Symbol=:mcts, solver_params=[:dpw, 1000, 10.0])
-    base_solver = solver_from_type(pomdp, solver_type; solver_params=solver_params)
-
-    𝒮_base = solve(base_solver, pomdp)
-    return 𝒮_base
-end
-
-function evaluate_proposed_objective(pomdp::KAgentPOMDP, π_proposed, π_infer, data::ExperienceBuffer, q_objectives)
-    # use equation (6) from the VAE paper Structural Relational Inference Actor-Critic for Multi-Agent Reinforcement Learning (Zhang et. al.)
-
-    # three eval types
-    # NOTE: q(z|o) refers to likelihood of underlying feature (z) w.r.t. observations (o)
-    ## Here, z is the proposed objective set, and o is the timeseries of observed actions
-    ## We can define q(z|o) approximately as the proposal distribution
-    # NOTE: -H(q(z|o)): sum of the negative log likelihoods of each of the objectives in the proposed objective set, using the proposal distribution
-    ## Compute as: ∑_{z_i∈z}q(z_i|o)*log(q(z_i|o))
-
-    # Type 1: E_q[log(p(o|z))]
-    ## approximately equivalent to the Open-ended SIPS approach of P(g|π,o)/Q(g) (error of reconstruction to true obs weighted by likelihood of reconstruction)
-    ### Approximate E_q[p(o|z)] as (∑π(a_true) ∀ a ∈ [set of observations]) * q(z|o)
-    ### This is an adaptation of the Open-ended SIPS approach
-
-    # Type 2: -H(q(z|o)) - E_q[log(p(o|z))]
-    ## The combination of Open-ended SIPS with the L_VAE from SRI-AC
-
-    # Type 3: -H(q(z|o)) - E_q[log(p_iq(o|z))]: Using IQLearn's output as a softer, smoothened, broader point of comparison, instead of directly against data
-    ## 
-
-    # standard mechanism to evaluate
-    let s = rand(initialstate(pomdp)), o = rand(initialobs(pomdp, s)), a = Flux.onehot(:nw, actions(pomdp))
-        action(π_infer, o) # fully unnecessary to construct this, just doing this for example's sake
-        Crux.value(π_proposed, o, a) # use the observation to produce this
-        Crux.value(π_proposed, MuKumari.shape_state_as_obs(pomdp, s), a) # alternatively, use the internal func`shape_state_as_obs` function on a state directly
-        j = 1
-        Crux.value(π_infer, data.data[:s][:,j], data.data[:a][:,j]) # OR evaluate on a timestep drawn from of the ExperienceBuffer (at time = j)
-    end
+function quick_policy_compute_for_pomdp(pomdp::KAgentPOMDP; solver_type::Symbol=:mcts, solver_params=[:dpw, 1000, 10.0])
+    𝒮_pomdp = solver_from_type(pomdp, solver_type; solver_params=solver_params)
+    π_pomdp = solve(𝒮_pomdp, pomdp)
+    return 𝒮_pomdp, π_pomdp
 end
 
 function quick_IQL(kworld::KWorld, anon_data::ExperienceBuffer; plot_metrics::Bool=false)
@@ -133,10 +107,10 @@ function quick_IQL(kworld::KWorld, anon_data::ExperienceBuffer; plot_metrics::Bo
 
     𝒟_iql = OnlineIQLearn(π=A(), 𝒟_demo=anon_data, S=S, γ=γ, N=anon_data.elements, ΔN=1, c_opt=(;epochs=1),reg=false,gp=false, log=(;period=50))
 
-    solve(𝒟_iql, mdp)
+    π_iql = solve(𝒟_iql, mdp)
 
     if plot_metrics; f = plot_learning([𝒟_iql,], title="Results of IQ-Learning", labels=["iql",]); else; f = nothing; end
-    return 𝒟_iql, mdp, f
+    return π_iql, 𝒟_iql, mdp, f
 end
 
 function kworld_for_inference(possible_goals::Vector;
@@ -189,7 +163,107 @@ function construct_q_proposals(infer_kworld; inf_agent_start::Matrix=[3. 3.])
                                               :w => 0., :v => 0.))
         (np[1], infer_kworld.inhabitants[string(np[1])])
     end |> Dict
-    return proposal_names, name_to_obj_comp_list, name_to_q_proposal, name_to_proposed_mdp
+    return proposal_names, q_objs, name_to_obj_comp_list, name_to_q_proposal, name_to_proposed_mdp
+end
+
+function precompute_π_proposals(name_to_proposed_mdp; solver_type=:dql, solver_params=[:softq, 10000])
+    name_to_𝒮_proposal = Dict()
+    name_to_π_proposal = Dict()
+    for (name, mdp) in name_to_proposed_mdp
+        println("\nNow computing policy for proposal: ", name)
+        name_to_𝒮_proposal[name], name_to_π_proposal[name] = quick_policy_compute_for_pomdp(mdp; solver_type=solver_type, solver_params=solver_params)
+    end
+    return name_to_𝒮_proposal, name_to_π_proposal
+end
+
+struct ScoreΠDist <: Distribution{Nothing}
+    prop_names::Vector
+    q_objs::Dict
+    n_compobj_list::Dict
+    n_qprop_list::Dict
+    n_propmdp_list::Dict
+    n_𝒮_proposals::Dict
+    n_π_proposals::Dict
+end
+
+function precompute_π_dist(infer_kworld; solver_type=:dql, solver_params=[:softq, 10000])
+    prop_names, q_objs, n_compobj_list, n_qprop_list, n_propmdp_list = construct_q_proposals(infer_kworld)
+    n_𝒮_proposals, n_π_proposals = precompute_π_proposals(n_propmdp_list; solver_type=solver_type, solver_params=solver_params)
+
+    ScoreΠDist(prop_names, q_objs, n_compobj_list, n_qprop_list, n_propmdp_list, n_𝒮_proposals, n_π_proposals)
+end
+
+"""
+    prior_sh_entropy_obj(prop_name, component_objectives_dict, q_proposal_dict)
+
+Compute the Shannon Entropy over the prior distribution for the given proposal.
+
+This comes out to be: H(q(z|o))
+    NOTE: -H(q(z|o)): sum of the negative log likelihoods of each of the objectives in the proposed objective set, using the proposal distribution
+    Compute as: ∑_{z_i∈z}q(z_i|o)*log(q(z_i|o))
+
+Used as a regularizer to the evaluation function, so that less likely proposals receive less emphasis.
+"""
+function prior_sh_entropy_obj(π_dist::ScoreΠDist, prop_name)
+    component_objectives_dict = π_dist.n_compobj_list
+    q_proposal_dict = π_dist.q_objs
+    mapreduce(n->q_proposal_dict[[n]] * log(q_proposal_dict[[n]]), +, component_objectives_dict[prop_name], init=0)
+end
+
+function expected_data_recons_err(π_dist::ScoreΠDist, prop_name, data::ExperienceBuffer; eval_tsteps=100, init_eval_tstep=1)
+    mdp = π_dist.n_propmdp_list[prop_name]
+    q_zo = π_dist.n_qprop_list[prop_name]
+    π_prop = π_dist.n_π_proposals[prop_name]
+    all_a_onehot = Flux.onehotbatch(actions(mdp), actions(mdp))
+
+    expectation_sum = 0
+    for i in 1:eval_tsteps
+        if i > data.elements
+            break
+        end
+        recon_val = Crux.value(π_prop, data.data[:s][:,i], all_a_onehot)
+        recon_prob = softmax(recon_val .- maximum(recon_val), dims=2) * data.data[:a][:,i]
+        # sum log prob (clip value to prevent underflow to -∞)
+        expectation_sum += log(max(recon_prob[1], 1e-30))
+    end
+    return q_zo * expectation_sum
+end
+
+"""
+    evaluate_proposed_objective(pomdp::KAgentPOMDP, π_proposed, π_infer, data::ExperienceBuffer, q_objectives)
+
+Evaluates the provided policy (π_proposed) under three different evaluation schemes.
+
+Based off Equation (6) from the VAE paper Structural Relational Inference Actor-Critic for Multi-Agent Reinforcement Learning (Zhang et. al.)
+Below is a discussion of the three evaluation schemes.
+
+NOTE: q(z|o) refers to likelihood of underlying feature (z) w.r.t. observations (o)
+ * Here, z is the proposed objective set, and o is the timeseries of observed actions
+ * We can define q(z|o) approximately as the proposal distribution
+
+Scheme 1: E_q[log(p(o|z))]
+ * approximately equivalent to the Open-ended SIPS approach of P(g|π,o)/Q(g) (error of reconstruction to true obs weighted by likelihood of reconstruction)
+ * Approximate E_q[p(o|z)] as (∑π(a_true) ∀ a ∈ [set of observations]) * q(z|o)
+ * This is an adaptation of the Open-ended SIPS approach
+
+Scheme 2: E_q[log(p(o|z))] + H(q(z|o))
+ * The combination of Open-ended SIPS with the L_VAE from SRI-AC
+
+Scheme 3: E_q[log(p_iq(o|z))] + H(q(z|o)): Using IQLearn's output as a softer, smoothened, broader point of comparison, instead of directly against data
+"""
+function evaluate_proposed_objective(π_dist::ScoreΠDist, prop_name, π_infer, data::ExperienceBuffer)
+    # standard mechanism to evaluate
+
+    eval_1 = expected_data_recons_err(π_dist, prop_name, π_infer, data; eval_tsteps=100, init_eval_tstep=1)
+    eval_2 = expected_data_recons_err(π_dist, prop_name, π_infer, data; eval_tsteps=100, init_eval_tstep=1) + prior_sh_entropy_obj(π_dist, prop_name)
+
+    # let s = rand(initialstate(pomdp)), o = rand(initialobs(pomdp, s)), a = Flux.onehot(:nw, actions(pomdp))
+    #     action(π_infer, o) # fully unnecessary to construct this, just doing this for example's sake
+    #     Crux.value(π_proposed, o, a) # use the observation to produce this
+    #     Crux.value(π_proposed, MuKumari.shape_state_as_obs(pomdp, s), a) # alternatively, use the internal func`shape_state_as_obs` function on a state directly
+    #     j = 1
+    #     Crux.value(π_infer, data.data[:s][:,j], data.data[:a][:,j]) # OR evaluate on a timestep drawn from of the ExperienceBuffer (at time = j)
+    # end
 end
 
 println("Directory is: ", @__DIR__)
@@ -199,7 +273,13 @@ script_dir = @__DIR__
 (kworld, data, anon_data) = BSON.load(script_dir*"/single_start_exp.bson")[:data]
 anon_data.elements = 996 # manual edit of this specific data file to account for empty end values
 
-𝒟_iql, mdp, f = quick_IQL(kworld, anon_data; plot_metrics=false)
+π_iql, 𝒟_iql, mdp, f = quick_IQL(kworld, anon_data; plot_metrics=false)
+
+# kworld_infer = kworld_for_inference(kworld.glob_landscape.goals[1:end-1]; known_kworld=kworld)
+kworld_infer = kworld_for_inference(kworld.glob_landscape.goals[1:end-1];
+                                    known_obcs=kworld.glob_landscape.obstacles, known_env=mdp.menv, dims=mdp.dimensions)
+
+π_dist = precompute_π_dist(kworld_infer; solver_type=:dql, solver_params=[:softq, 10000])
 
 # forward_estim_solver = :softq
 # 𝒮_dqn_metric_net = deep_q_solver(mdp; solver_params=[forward_estim_solver, 10000])
