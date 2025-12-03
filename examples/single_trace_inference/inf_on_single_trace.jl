@@ -217,6 +217,7 @@ function expected_data_recons_err(π_dist::ScoreΠDist, prop_name, data::Experie
     all_a_onehot = Flux.onehotbatch(actions(mdp), actions(mdp))
 
     expectation_sum = 0
+    exp_sum_tracker = Matrix{Any}(undef, eval_tsteps, 3)
     for i in 1:eval_tsteps
         if i > data.elements
             break
@@ -224,9 +225,45 @@ function expected_data_recons_err(π_dist::ScoreΠDist, prop_name, data::Experie
         recon_val = Crux.value(π_prop, data.data[:s][:,i], all_a_onehot)
         recon_prob = softmax(recon_val .- maximum(recon_val), dims=2) * data.data[:a][:,i]
         # sum log prob (clip value to prevent underflow to -∞)
-        expectation_sum += log(max(recon_prob[1], 1e-30))
+        log_likelihood_recon_prob = log(max(recon_prob[1], 1e-30))
+        expectation_sum += log_likelihood_recon_prob
+        exp_sum_tracker[i, :] = [data.data[:s][:,i], log_likelihood_recon_prob, q_zo * expectation_sum]
     end
-    return q_zo * expectation_sum
+    return q_zo * expectation_sum, exp_sum_tracker
+end
+
+function grid_points(n, dims=(0.,10.))
+    dim_span = dims[2] - dims[1]
+    dim_shift = dim_span / 20 # 5% shift
+    nx = ceil(Int, sqrt(n))
+    ny = ceil(Int, n/nx)
+    xs = range(dims[1]+dim_shift, dims[2]-dim_shift; length=nx)
+    ys = range(dims[1]+dim_shift, dims[2]-dim_shift; length=ny)
+    collect(Iterators.take(([x y] for y in ys for x in xs), n))
+end
+
+function expected_recons_err_against_iql(π_dist::ScoreΠDist, prop_name, π_iql; eval_num=100)
+    mdp = π_dist.n_propmdp_list[prop_name]
+    q_zo = π_dist.n_qprop_list[prop_name]
+    π_prop = π_dist.n_π_proposals[prop_name]
+    all_a_onehot = Flux.onehotbatch(actions(mdp), actions(mdp))
+
+    eval_locations = grid_points(eval_num, mdp.dimensions)
+    mdp_states = map(x->blindstart_KAgentState(mdp, x), eval_locations)
+    mdp_states_as_obs = map(s->MuKumari.shape_state_as_obs(mdp, s), mdp_states)
+    iql_optimal_actions = map(s->action(π_iql, s)[1], mdp_states_as_obs)
+
+    expectation_sum = 0
+    exp_sum_tracker = Matrix{Any}(undef, eval_num, 3)
+    for i in 1:eval_num
+        recon_val = Crux.value(π_prop, mdp_states_as_obs[i], all_a_onehot)
+        recon_prob = softmax(recon_val .- maximum(recon_val), dims=2) * Flux.onehot(iql_optimal_actions[i], actions(mdp))
+        # sum log prob (clip value to prevent underflow to -∞)
+        log_likelihood_recon_prob = log(max(recon_prob[1], 1e-30))
+        expectation_sum += log_likelihood_recon_prob
+        exp_sum_tracker[i, :] = [eval_locations[i], log_likelihood_recon_prob, q_zo * expectation_sum]
+    end
+    return q_zo * expectation_sum, exp_sum_tracker
 end
 
 """
@@ -251,11 +288,16 @@ Scheme 2: E_q[log(p(o|z))] + H(q(z|o))
 
 Scheme 3: E_q[log(p_iq(o|z))] + H(q(z|o)): Using IQLearn's output as a softer, smoothened, broader point of comparison, instead of directly against data
 """
-function evaluate_proposed_objective(π_dist::ScoreΠDist, prop_name, π_infer, data::ExperienceBuffer)
+function evaluate_proposed_objective(π_dist::ScoreΠDist, prop_name, π_iql, data::ExperienceBuffer; eval_steps=100)
     # standard mechanism to evaluate
 
-    eval_1 = expected_data_recons_err(π_dist, prop_name, π_infer, data; eval_tsteps=100, init_eval_tstep=1)
-    eval_2 = expected_data_recons_err(π_dist, prop_name, π_infer, data; eval_tsteps=100, init_eval_tstep=1) + prior_sh_entropy_obj(π_dist, prop_name)
+    eval_1 = expected_data_recons_err(π_dist, prop_name, data; eval_tsteps=eval_steps, init_eval_tstep=1)
+    eval_2 = (eval_1[1] + prior_sh_entropy_obj(π_dist, prop_name), eval_1[2])
+    eval_2[2][:,2:3] .+= prior_sh_entropy_obj(π_dist, prop_name)
+    eval_3 = expected_recons_err_against_iql(π_dist, prop_name, π_iql; eval_num=eval_steps)
+
+    println("Scores under different eval schemes:: Proposal named: ", prop_name)
+    println("\tScheme 1: ", eval_1[1], " | Scheme 2: ", eval_2, " | Scheme 3: ", eval_3[1])
 
     # let s = rand(initialstate(pomdp)), o = rand(initialobs(pomdp, s)), a = Flux.onehot(:nw, actions(pomdp))
     #     action(π_infer, o) # fully unnecessary to construct this, just doing this for example's sake
@@ -264,6 +306,59 @@ function evaluate_proposed_objective(π_dist::ScoreΠDist, prop_name, π_infer, 
     #     j = 1
     #     Crux.value(π_infer, data.data[:s][:,j], data.data[:a][:,j]) # OR evaluate on a timestep drawn from of the ExperienceBuffer (at time = j)
     # end
+
+    return eval_1, eval_2, eval_3
+end
+
+function evaluate_all_proposed_objs(π_dist::ScoreΠDist, π_iql, data::ExperienceBuffer; eval_steps=100)
+    prop_evals = Dict{Any, Any}()
+    for prop_name in π_dist.prop_names
+        prop_evals[prop_name] = evaluate_proposed_objective(π_dist, prop_name, π_iql, data; eval_steps=eval_steps)
+    end
+    return prop_evals
+end
+
+function plot_evaluations_over_timesteps(evals::Tuple)
+    # specifically extract the third column (cumulative log likelihood)
+    eval_timeseries = map(ev->ev[2][:,3], evals)
+    time_axis = 1:size(eval_timeseries[1])[1]
+
+    plt = plot(xlabel="# of Data Points Evaluated", ylabel="Neg. Log Likelihood", lw=2)
+
+    for (i, ts) in enumerate(eval_timeseries)
+        plot!(plt, time_axis, ts, label="Scheme $i")
+    end
+
+    plt
+end
+
+function plot_evaluations_over_timesteps(evals::Dict)
+    # specifically extract the third column (cumulative log likelihood)
+    # time_axis = 1:size(eval_timeseries[1])[1]
+    time_axis = 1:size(evals[first(keys(evals))][1][2][:,3])[1]
+    scheme_names = Dict(1=>"Open-ended SIPS", 2=>"Entropy-biased SIPS", 3=>"IQLearn-guided SIPS")
+
+    plt = plot(xlabel="# of Data Points Evaluated", ylabel="Neg. Log Likelihood",
+               title="Effectiveness of proposed objective evaluation\nunder various SIPS schemes", lw=2)
+
+    proposals = collect(keys(evals))
+    base_colors = palette(:tab10, length(proposals)*2)
+    linestyles = (:solid, :dash, :dot)
+
+    for (i, key) in pairs(proposals)
+        data = map(ev->ev[2][:,3], evals[key])
+        color = base_colors[i]
+
+        for (j, ts) in enumerate(data)
+            if j==2
+                continue
+            end
+            plot!(plt, time_axis, ts, label="$key ($(scheme_names[j][1:end-5]))", color=color,
+                  linestyle=linestyles[j], linewidth=2)
+        end
+    end
+
+    plt
 end
 
 println("Directory is: ", @__DIR__)
@@ -276,7 +371,7 @@ anon_data.elements = 996 # manual edit of this specific data file to account for
 π_iql, 𝒟_iql, mdp, f = quick_IQL(kworld, anon_data; plot_metrics=false)
 
 # kworld_infer = kworld_for_inference(kworld.glob_landscape.goals[1:end-1]; known_kworld=kworld)
-kworld_infer = kworld_for_inference(kworld.glob_landscape.goals[1:end-1];
+kworld_infer = kworld_for_inference(kworld.glob_landscape.goals[1:end];
                                     known_obcs=kworld.glob_landscape.obstacles, known_env=mdp.menv, dims=mdp.dimensions)
 
 π_dist = precompute_π_dist(kworld_infer; solver_type=:dql, solver_params=[:softq, 10000])
