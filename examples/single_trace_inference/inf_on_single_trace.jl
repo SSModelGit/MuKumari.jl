@@ -5,6 +5,7 @@ using Combinatorics: powerset
 
 using POMDPTools, MCTS, POMDPLinter
 using Match: @match
+using Parameters: @with_kw
 
 # addressing weird load order bugs
 using Plots
@@ -176,7 +177,7 @@ function precompute_π_proposals(name_to_proposed_mdp; solver_type=:dql, solver_
     return name_to_𝒮_proposal, name_to_π_proposal
 end
 
-struct ScoreΠDist <: Distribution{Nothing}
+@with_kw struct ScoreΠDist <: Distribution{Nothing}
     prop_names::Vector
     q_objs::Dict
     n_compobj_list::Dict
@@ -184,13 +185,36 @@ struct ScoreΠDist <: Distribution{Nothing}
     n_propmdp_list::Dict
     n_𝒮_proposals::Dict
     n_π_proposals::Dict
+    solver_type::Symbol = :dql
+    solver_params::Vector = [:softq, 10000]
+end
+
+# define getter functions
+get_proposal_names(π_dist::ScoreΠDist) = π_dist.prop_names
+get_proposal_component_priors(π_dist::ScoreΠDist) = π_dist.q_objs
+get_proposal_component_objectives(π_dist::ScoreΠDist, proposal) = π_dist.n_compobj_list[proposal]
+get_proposal_prior(π_dist::ScoreΠDist, proposal) = π_dist.n_qprop_list[proposal]
+get_proposal_pomdp(π_dist::ScoreΠDist, proposal) = π_dist.n_propmdp_list[proposal]
+
+get_𝒮_proposal(π_dist::ScoreΠDist, proposal) = get!(π_dist.n_𝒮_proposals, proposal) do 
+    solver_from_type(get_proposal_pomdp(π_dist, proposal), π_dist.solver_type; π_dist.solver_params)
+end
+
+get_π_proposal(π_dist::ScoreΠDist, proposal) = get!(π_dist.n_π_proposals, proposal) do 
+    solve(get_𝒮_proposal(π_dist, proposal), get_proposal_pomdp(π_dist, proposal))
+end
+
+function lazy_precompute_π_dist(infer_kworld; solver_type=:dql, solver_params=[:softq, 10000])
+    prop_names, q_objs, n_compobj_list, n_qprop_list, n_propmdp_list = construct_q_proposals(infer_kworld)
+    n_𝒮_proposals, n_π_proposals = [Dict{Any, Any}() for i in 1:2]
+    ScoreΠDist(prop_names, q_objs, n_compobj_list, n_qprop_list, n_propmdp_list, n_𝒮_proposals, n_π_proposals, solver_type, solver_params)
 end
 
 function precompute_π_dist(infer_kworld; solver_type=:dql, solver_params=[:softq, 10000])
     prop_names, q_objs, n_compobj_list, n_qprop_list, n_propmdp_list = construct_q_proposals(infer_kworld)
     n_𝒮_proposals, n_π_proposals = precompute_π_proposals(n_propmdp_list; solver_type=solver_type, solver_params=solver_params)
 
-    ScoreΠDist(prop_names, q_objs, n_compobj_list, n_qprop_list, n_propmdp_list, n_𝒮_proposals, n_π_proposals)
+    ScoreΠDist(prop_names, q_objs, n_compobj_list, n_qprop_list, n_propmdp_list, n_𝒮_proposals, n_π_proposals, solver_type, solver_params)
 end
 
 """
@@ -205,20 +229,19 @@ This comes out to be: H(q(z|o))
 Used as a regularizer to the evaluation function, so that less likely proposals receive less emphasis.
 """
 function prior_sh_entropy_obj(π_dist::ScoreΠDist, prop_name)
-    component_objectives_dict = π_dist.n_compobj_list
-    q_proposal_dict = π_dist.q_objs
-    mapreduce(n->q_proposal_dict[[n]] * log(q_proposal_dict[[n]]), +, component_objectives_dict[prop_name], init=0)
+    q_proposal_dict = get_proposal_component_priors(π_dist)
+    mapreduce(n->q_proposal_dict[[n]] * log(q_proposal_dict[[n]]), +, get_proposal_component_objectives(π_dist, prop_name), init=0)
 end
 
 function expected_data_recons_err(π_dist::ScoreΠDist, prop_name, data::ExperienceBuffer; eval_tsteps=100, init_eval_tstep=1)
-    mdp = π_dist.n_propmdp_list[prop_name]
-    q_zo = π_dist.n_qprop_list[prop_name]
-    π_prop = π_dist.n_π_proposals[prop_name]
+    mdp = get_proposal_pomdp(π_dist, prop_name)
+    q_zo = get_proposal_prior(π_dist, prop_name)
+    π_prop = get_π_proposal(π_dist, prop_name)
     all_a_onehot = Flux.onehotbatch(actions(mdp), actions(mdp))
 
     expectation_sum = 0
     exp_sum_tracker = Matrix{Any}(undef, eval_tsteps, 3)
-    for i in 1:eval_tsteps
+    for i in init_eval_tstep:(init_eval_tstep+eval_tsteps)
         if i > data.elements
             break
         end
@@ -243,9 +266,9 @@ function grid_points(n, dims=(0.,10.))
 end
 
 function expected_recons_err_against_iql(π_dist::ScoreΠDist, prop_name, π_iql; eval_num=100)
-    mdp = π_dist.n_propmdp_list[prop_name]
-    q_zo = π_dist.n_qprop_list[prop_name]
-    π_prop = π_dist.n_π_proposals[prop_name]
+    mdp = get_proposal_pomdp(π_dist, prop_name)
+    q_zo = get_proposal_prior(π_dist, prop_name)
+    π_prop = get_π_proposal(π_dist, prop_name)
     all_a_onehot = Flux.onehotbatch(actions(mdp), actions(mdp))
 
     eval_locations = grid_points(eval_num, mdp.dimensions)
@@ -312,7 +335,7 @@ end
 
 function evaluate_all_proposed_objs(π_dist::ScoreΠDist, π_iql, data::ExperienceBuffer; eval_steps=100)
     prop_evals = Dict{Any, Any}()
-    for prop_name in π_dist.prop_names
+    for prop_name in get_proposal_names(π_dist)
         prop_evals[prop_name] = evaluate_proposed_objective(π_dist, prop_name, π_iql, data; eval_steps=eval_steps)
     end
     return prop_evals
@@ -383,14 +406,14 @@ possible_goals = [
 ]
 
 # kworld_infer = kworld_for_inference(kworld.glob_landscape.goals[1:end-1]; known_kworld=kworld)
-kworld_infer = kworld_for_inference(possible_goals;
+kworld_infer = kworld_for_inference(possible_goals[1:4];
                                     known_obcs=kworld.glob_landscape.obstacles, known_env=mdp.menv, dims=mdp.dimensions)
 
-π_dist = precompute_π_dist(kworld_infer; solver_type=:dql, solver_params=[:softq, 10000])
+π_dist = precompute_π_dist(kworld_infer; solver_type=:dql, solver_params=[:softq, 2000])
 
 evds = evaluate_all_proposed_objs(π_dist, π_iql, anon_data; eval_steps=100)
 plt = plot_evaluations_over_timesteps(evds)
-savefig("four_corner_objs_sips_eval_efficacy_comparison.png")
+savefig(script_dir*"/four_corner_objs_sips_eval_efficacy_comparison.png")
 plt
 
 # forward_estim_solver = :softq
