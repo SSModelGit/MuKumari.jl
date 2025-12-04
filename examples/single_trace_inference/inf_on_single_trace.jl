@@ -229,7 +229,7 @@ function expected_data_recons_err(π_dist::ScoreΠDist, prop_name, data::Experie
         expectation_sum += log_likelihood_recon_prob
         exp_sum_tracker[i, :] = [data.data[:s][:,i], log_likelihood_recon_prob, q_zo * expectation_sum]
     end
-    return q_zo * expectation_sum, exp_sum_tracker
+    return expectation_sum, exp_sum_tracker
 end
 
 function grid_points(n, dims=(0.,10.))
@@ -263,7 +263,7 @@ function expected_recons_err_against_iql(π_dist::ScoreΠDist, prop_name, π_iql
         expectation_sum += log_likelihood_recon_prob
         exp_sum_tracker[i, :] = [eval_locations[i], log_likelihood_recon_prob, q_zo * expectation_sum]
     end
-    return q_zo * expectation_sum, exp_sum_tracker
+    return expectation_sum, exp_sum_tracker
 end
 
 """
@@ -370,11 +370,28 @@ anon_data.elements = 996 # manual edit of this specific data file to account for
 
 π_iql, 𝒟_iql, mdp, f = quick_IQL(kworld, anon_data; plot_metrics=false)
 
+possible_goals = [
+        (:ne, Dict(:target=>[9.5 9.5], :strength=>10., :influence=>5., :size=>0.75)),
+        (:nw, Dict(:target=>[2.5 9.5], :strength=>10., :influence=>5., :size=>0.75)),
+        (:se, Dict(:target=>[9.5 2.5], :strength=>10., :influence=>5., :size=>0.75)),
+        (:sw, Dict(:target=>[1.5 2.5], :strength=>10., :influence=>5., :size=>0.75)),
+        (:c, Dict(:target=>[5.5 5.5], :strength=>10., :influence=>5., :size=>0.75)),
+        (:e, Dict(:target=>[9.5 5.5], :strength=>10., :influence=>5., :size=>0.75)),
+        (:w, Dict(:target=>[1.5 5.5], :strength=>10., :influence=>5., :size=>0.75)),
+        (:n, Dict(:target=>[1.5 9.5], :strength=>10., :influence=>5., :size=>0.75)),
+        (:s, Dict(:target=>[1.5 1.5], :strength=>10., :influence=>5., :size=>0.75)),
+]
+
 # kworld_infer = kworld_for_inference(kworld.glob_landscape.goals[1:end-1]; known_kworld=kworld)
-kworld_infer = kworld_for_inference(kworld.glob_landscape.goals[1:end];
+kworld_infer = kworld_for_inference(possible_goals;
                                     known_obcs=kworld.glob_landscape.obstacles, known_env=mdp.menv, dims=mdp.dimensions)
 
 π_dist = precompute_π_dist(kworld_infer; solver_type=:dql, solver_params=[:softq, 10000])
+
+evds = evaluate_all_proposed_objs(π_dist, π_iql, anon_data; eval_steps=100)
+plt = plot_evaluations_over_timesteps(evds)
+savefig("four_corner_objs_sips_eval_efficacy_comparison.png")
+plt
 
 # forward_estim_solver = :softq
 # 𝒮_dqn_metric_net = deep_q_solver(mdp; solver_params=[forward_estim_solver, 10000])
