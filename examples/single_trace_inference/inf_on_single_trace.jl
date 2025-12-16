@@ -18,8 +18,9 @@ using CUDA, cuDNN
 using Crux
 
 # Utilizing Gen for generative approach to particle filters
-using Gen: @gen, Distribution, logpdf, random, categorical
+using Gen: @gen, Distribution, categorical
 using Gen: ParticleFilterState, initialize_particle_filter, particle_filter_step!, maybe_resample!, get_traces, get_retval
+import Gen
 
 # Save data
 using JLD2: @save, @load
@@ -204,17 +205,29 @@ get_π_proposal(π_dist::ScoreΠDist, proposal) = get!(π_dist.n_π_proposals, p
     solve(get_𝒮_proposal(π_dist, proposal), get_proposal_pomdp(π_dist, proposal))
 end
 
-function lazy_precompute_π_dist(infer_kworld; solver_type=:dql, solver_params=[:softq, 10000])
+store_π_iql(π_dist::ScoreΠDist, π_iql) = push!(π_dist.n_π_proposals, :iql=>π_iql)
+get_π_iql(π_dist::ScoreΠDist) = get(π_dist.n_π_proposals, :iql, nothing)
+
+function lazy_precompute_π_dist(infer_kworld; solver_type=:dql, solver_params=[:softq, 10000], π_iql::Any=nothing)
     prop_names, q_objs, n_compobj_list, n_qprop_list, n_propmdp_list = construct_q_proposals(infer_kworld)
     n_𝒮_proposals, n_π_proposals = [Dict{Any, Any}() for i in 1:2]
-    ScoreΠDist(prop_names, q_objs, n_compobj_list, n_qprop_list, n_propmdp_list, n_𝒮_proposals, n_π_proposals, solver_type, solver_params)
+    π_dist = ScoreΠDist(prop_names, q_objs, n_compobj_list, n_qprop_list, n_propmdp_list, n_𝒮_proposals, n_π_proposals, solver_type, solver_params)
+
+    if !isnothing(π_iql); store_π_iql(π_dist, π_iql);
+    else; @warn "Need to separately store π_iql inside π_dist! Otherwise risks evaluations erroring out."; end
+
+    return π_dist
 end
 
-function precompute_π_dist(infer_kworld; solver_type=:dql, solver_params=[:softq, 10000])
+function precompute_π_dist(infer_kworld; solver_type=:dql, solver_params=[:softq, 10000], π_iql::Any=nothing)
     prop_names, q_objs, n_compobj_list, n_qprop_list, n_propmdp_list = construct_q_proposals(infer_kworld)
     n_𝒮_proposals, n_π_proposals = precompute_π_proposals(n_propmdp_list; solver_type=solver_type, solver_params=solver_params)
 
-    ScoreΠDist(prop_names, q_objs, n_compobj_list, n_qprop_list, n_propmdp_list, n_𝒮_proposals, n_π_proposals, solver_type, solver_params)
+    π_dist = ScoreΠDist(prop_names, q_objs, n_compobj_list, n_qprop_list, n_propmdp_list, n_𝒮_proposals, n_π_proposals, solver_type, solver_params)
+    if !isnothing(π_iql); store_π_iql(π_dist, π_iql);
+    else; @warn "Need to separately store π_iql inside π_dist! Otherwise risks evaluations erroring out."; end
+
+    return π_dist
 end
 
 """
@@ -241,7 +254,7 @@ function expected_data_recons_err(π_dist::ScoreΠDist, prop_name, data::Experie
 
     expectation_sum = 0
     exp_sum_tracker = Matrix{Any}(undef, eval_tsteps, 3)
-    for i in init_eval_tstep:(init_eval_tstep+eval_tsteps)
+    for i in init_eval_tstep:(init_eval_tstep+eval_tsteps-1)
         if i > data.elements
             break
         end
@@ -250,7 +263,7 @@ function expected_data_recons_err(π_dist::ScoreΠDist, prop_name, data::Experie
         # sum log prob (clip value to prevent underflow to -∞)
         log_likelihood_recon_prob = log(max(recon_prob[1], 1e-30))
         expectation_sum += log_likelihood_recon_prob
-        exp_sum_tracker[i, :] = [data.data[:s][:,i], log_likelihood_recon_prob, q_zo * expectation_sum]
+        exp_sum_tracker[i-init_eval_tstep+1, :] = [data.data[:s][:,i], log_likelihood_recon_prob, q_zo * expectation_sum]
     end
     return expectation_sum, exp_sum_tracker
 end
@@ -265,7 +278,11 @@ function grid_points(n, dims=(0.,10.))
     collect(Iterators.take(([x y] for y in ys for x in xs), n))
 end
 
-function expected_recons_err_against_iql(π_dist::ScoreΠDist, prop_name, π_iql; eval_num=100)
+function expected_recons_err_against_iql(π_dist::ScoreΠDist, prop_name; π_iql::Any=nothing, eval_num=100)
+    # Assert that IQLearn Policy has been assigned, in order to do evaluation!
+    @assert !(isnothing(π_iql) && isnothing(get_π_iql(π_dist))) "Need to specify π_iql at call-time or store in π_dist ahead of time!"
+    if isnothing(π_iql); π_iql = get_π_iql(π_dist); end
+
     mdp = get_proposal_pomdp(π_dist, prop_name)
     q_zo = get_proposal_prior(π_dist, prop_name)
     π_prop = get_π_proposal(π_dist, prop_name)
@@ -311,13 +328,13 @@ Scheme 2: E_q[log(p(o|z))] + H(q(z|o))
 
 Scheme 3: E_q[log(p_iq(o|z))] + H(q(z|o)): Using IQLearn's output as a softer, smoothened, broader point of comparison, instead of directly against data
 """
-function evaluate_proposed_objective(π_dist::ScoreΠDist, prop_name, π_iql, data::ExperienceBuffer; eval_steps=100)
+function evaluate_proposed_objective(π_dist::ScoreΠDist, prop_name, data::ExperienceBuffer; eval_steps=100, π_iql::Any=nothing)
     # standard mechanism to evaluate
 
     eval_1 = expected_data_recons_err(π_dist, prop_name, data; eval_tsteps=eval_steps, init_eval_tstep=1)
     eval_2 = (eval_1[1] + prior_sh_entropy_obj(π_dist, prop_name), eval_1[2])
     eval_2[2][:,2:3] .+= prior_sh_entropy_obj(π_dist, prop_name)
-    eval_3 = expected_recons_err_against_iql(π_dist, prop_name, π_iql; eval_num=eval_steps)
+    eval_3 = expected_recons_err_against_iql(π_dist, prop_name; eval_num=eval_steps, π_iql=π_iql)
 
     println("Scores under different eval schemes:: Proposal named: ", prop_name)
     println("\tScheme 1: ", eval_1[1], " | Scheme 2: ", eval_2, " | Scheme 3: ", eval_3[1])
@@ -333,10 +350,25 @@ function evaluate_proposed_objective(π_dist::ScoreΠDist, prop_name, π_iql, da
     return eval_1, eval_2, eval_3
 end
 
-function evaluate_all_proposed_objs(π_dist::ScoreΠDist, π_iql, data::ExperienceBuffer; eval_steps=100)
+function Gen.logpdf(d::ScoreΠDist, ::Nothing; idx, o_t)
+    q = get_proposal_names(d)[idx]
+    return evaluate_proposed_objective(d, q, o_t)[3]
+end
+
+function Gen.random(d::ScoreΠDist; idx, o_t)
+    return nothing
+end
+
+@gen function inference_model(π_dist::ScoreΠDist)
+    idx_names = get_proposal_names(π_dist)
+    idx_priors = [get_proposal_prior(π_dist, p) for p in idx_names]
+    idx ~ categorical(idx_priors)
+end
+
+function evaluate_all_proposed_objs(π_dist::ScoreΠDist, data::ExperienceBuffer; eval_steps=100, π_iql::Any=nothing)
     prop_evals = Dict{Any, Any}()
     for prop_name in get_proposal_names(π_dist)
-        prop_evals[prop_name] = evaluate_proposed_objective(π_dist, prop_name, π_iql, data; eval_steps=eval_steps)
+        prop_evals[prop_name] = evaluate_proposed_objective(π_dist, prop_name, data; eval_steps=eval_steps, π_iql=π_iql)
     end
     return prop_evals
 end
@@ -393,6 +425,7 @@ anon_data.elements = 996 # manual edit of this specific data file to account for
 
 π_iql, 𝒟_iql, mdp, f = quick_IQL(kworld, anon_data; plot_metrics=false)
 
+lazy_precompute = true
 possible_goals = [
         (:ne, Dict(:target=>[9.5 9.5], :strength=>10., :influence=>5., :size=>0.75)),
         (:nw, Dict(:target=>[2.5 9.5], :strength=>10., :influence=>5., :size=>0.75)),
@@ -406,15 +439,21 @@ possible_goals = [
 ]
 
 # kworld_infer = kworld_for_inference(kworld.glob_landscape.goals[1:end-1]; known_kworld=kworld)
-kworld_infer = kworld_for_inference(possible_goals[1:4];
+kworld_infer = kworld_for_inference(possible_goals[1:3];
                                     known_obcs=kworld.glob_landscape.obstacles, known_env=mdp.menv, dims=mdp.dimensions)
+if lazy_precompute
+    π_dist = lazy_precompute_π_dist(kworld_infer; solver_type=:dql, solver_params=[:softq, 2000], π_iql=π_iql)
+    println("Lazily precomputing proposal distribution π-dist")
+else
+    π_dist = precompute_π_dist(kworld_infer; solver_type=:dql, solver_params=[:softq, 2000], π_iql=π_iql)
+    println("Precomputing proposal distribution π-dist")
+end
 
-π_dist = precompute_π_dist(kworld_infer; solver_type=:dql, solver_params=[:softq, 2000])
-
-evds = evaluate_all_proposed_objs(π_dist, π_iql, anon_data; eval_steps=100)
-plt = plot_evaluations_over_timesteps(evds)
-savefig(script_dir*"/four_corner_objs_sips_eval_efficacy_comparison.png")
-plt
+# println("evaluating proposals within π-dist...")
+# evds = evaluate_all_proposed_objs(π_dist, anon_data; eval_steps=100)
+# plt = plot_evaluations_over_timesteps(evds)
+# savefig(script_dir*"/four_corner_objs_sips_eval_efficacy_comparison.png")
+# plt
 
 # forward_estim_solver = :softq
 # 𝒮_dqn_metric_net = deep_q_solver(mdp; solver_params=[forward_estim_solver, 10000])
