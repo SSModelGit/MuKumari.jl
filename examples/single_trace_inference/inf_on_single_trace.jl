@@ -178,6 +178,10 @@ function precompute_π_proposals(name_to_proposed_mdp; solver_type=:dql, solver_
     return name_to_𝒮_proposal, name_to_π_proposal
 end
 
+######################################################
+# Define Custom Distribution over Potential Objectives
+######################################################
+
 @with_kw struct ScoreΠDist <: Distribution{Nothing}
     prop_names::Vector
     q_objs::Dict
@@ -195,6 +199,7 @@ get_proposal_names(π_dist::ScoreΠDist) = π_dist.prop_names
 get_proposal_component_priors(π_dist::ScoreΠDist) = π_dist.q_objs
 get_proposal_component_objectives(π_dist::ScoreΠDist, proposal) = π_dist.n_compobj_list[proposal]
 get_proposal_prior(π_dist::ScoreΠDist, proposal) = π_dist.n_qprop_list[proposal]
+get_idxable_proposal_prior_list(π_dist::ScoreΠDist) = [get_proposal_prior(π_dist, p) for p in get_proposal_names(π_dist)]
 get_proposal_pomdp(π_dist::ScoreΠDist, proposal) = π_dist.n_propmdp_list[proposal]
 
 get_𝒮_proposal(π_dist::ScoreΠDist, proposal) = get!(π_dist.n_𝒮_proposals, proposal) do 
@@ -207,6 +212,10 @@ end
 
 store_π_iql(π_dist::ScoreΠDist, π_iql) = push!(π_dist.n_π_proposals, :iql=>π_iql)
 get_π_iql(π_dist::ScoreΠDist) = get(π_dist.n_π_proposals, :iql, nothing)
+
+##############################
+# Define Constructor Functions
+##############################
 
 function lazy_precompute_π_dist(infer_kworld; solver_type=:dql, solver_params=[:softq, 10000], π_iql::Any=nothing)
     prop_names, q_objs, n_compobj_list, n_qprop_list, n_propmdp_list = construct_q_proposals(infer_kworld)
@@ -229,6 +238,10 @@ function precompute_π_dist(infer_kworld; solver_type=:dql, solver_params=[:soft
 
     return π_dist
 end
+
+##########################################
+# Define distribution evaluation functions
+##########################################
 
 """
     prior_sh_entropy_obj(prop_name, component_objectives_dict, q_proposal_dict)
@@ -350,6 +363,10 @@ function evaluate_proposed_objective(π_dist::ScoreΠDist, prop_name, data::Expe
     return eval_1, eval_2, eval_3
 end
 
+##############################################
+# Define functions for custom Gen distribution
+##############################################
+
 function Gen.logpdf(d::ScoreΠDist, ::Nothing; idx, o_t)
     q = get_proposal_names(d)[idx]
     return evaluate_proposed_objective(d, q, o_t)[3]
@@ -360,8 +377,7 @@ function Gen.random(d::ScoreΠDist; idx, o_t)
 end
 
 @gen function inference_model(π_dist::ScoreΠDist)
-    idx_names = get_proposal_names(π_dist)
-    idx_priors = [get_proposal_prior(π_dist, p) for p in idx_names]
+    idx_priors = get_idxable_proposal_prior_list(π_dist)
     idx ~ categorical(idx_priors)
 end
 
