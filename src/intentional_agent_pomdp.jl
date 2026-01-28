@@ -43,6 +43,24 @@ Redefine the blind start function for the KAgentPOMDP.
 """
 blindstart_KAgentState(pomdp::KAgentPOMDP, x::Matrix) = KAgentState(x, [predict_env(pomdp.menv, x)], Matrix[])
 
+"""
+    shape_state_as_obs(pomdp::KAgentPOMDP, s::KAgentState)
+
+Useful form of `shape_state_as_obs` when there is no need to use a separate location than what is in `s`.
+Calls a deeper form of `shape_state_as_obs` using multiple dispatch.
+"""
+shape_state_as_obs(pomdp::KAgentPOMDP, s::KAgentState) = shape_state_as_obs(pomdp, s, s.x)
+
+"""
+    shape_state_as_obs(pomdp::KAgentPOMDP, s::KAgentState, x::Matrix)
+
+Helper function - useful when an algorithm wants to observe states in observation-vector form, and not KAgentState form.
+"""
+function shape_state_as_obs(pomdp::KAgentPOMDP, s::KAgentState, x::Matrix)
+    # return [x..., z(s)..., nearest_obstacles(pomdp, s)..., nearest_goals(pomdp, s)..., t(s)...]
+    return [x..., z(s)..., nearest_obstacles(pomdp, s)..., t(s)...]
+end
+
 function Base.show(io::IO, pomdp::KAgentPOMDP)
     println(io, "KAgent POMDP")
     println(io, "\tLength of grid-space along the x-dimension: $(pomdp.dimensions)")
@@ -58,7 +76,8 @@ nearest_obstacles(pomdp::KAgentPOMDP, s; k=2) = nearest_k_geometries(s.x, pomdp.
 nearest_goals(pomdp::KAgentPOMDP, s; k=1) = nearest_k_geometries(s.x, pomdp.goals, k) |> Iterators.flatten |> collect |> Iterators.flatten |> collect
 
 # POMDPs.initialobs(pomdp::KAgentPOMDP, s) = Deterministic([state(s)..., z(s)..., t(s)])
-POMDPs.initialobs(pomdp::KAgentPOMDP, s) = Deterministic([state(s)..., z(s)..., nearest_obstacles(pomdp, s)..., nearest_goals(pomdp, s)..., t(s)])
+POMDPs.initialobs(pomdp::KAgentPOMDP, s) = Deterministic(shape_state_as_obs(pomdp, s))
+# POMDPs.initialobs(pomdp::KAgentPOMDP, s) = Deterministic([state(s)..., z(s)..., nearest_obstacles(pomdp, s)..., nearest_goals(pomdp, s)..., t(s)])
 
 POMDPs.discount(pomdp::KAgentPOMDP) = pomdp.γ
 
@@ -84,8 +103,6 @@ action_heading_assoc_kagent = Dict([(:n,  normalize([ 0,  1])),
                                     (:nw, normalize([-1,  1])),
                                     (:c,  [0., 0.])])
 
-shape_state_as_obs(pomdp::KAgentPOMDP, s::KAgentState) = [state(s)..., z(s)..., nearest_obstacles(pomdp, s)..., nearest_goals(pomdp, s)..., t(s)...]
-
 function POMDPs.gen(pomdp::KAgentPOMDP, s::KAgentState, a::Symbol, rng)
     # add noise to the action taken (both in direction and speed)
     real_a = reshape(round.(rand(rng, MvNormal(action_heading_assoc_kagent[a], pomdp.w)), digits=pomdp.digits), (1,:)) # real action factoring in noise
@@ -108,7 +125,8 @@ function POMDPs.gen(pomdp::KAgentPOMDP, s::KAgentState, a::Symbol, rng)
     # Defining the observation state as:
     ## [Position [x], Position [y], Env obs vec, top-k nearest obstacles (vector-to), 8 quadrant obstacle count vector, [same near&count for goals], time]
     o_x = xp .+ reshape(round.(rand(rng, MvNormal([0.0, 0.0], pomdp.w)), digits=pomdp.digits), (1,:))
-    o = [o_x..., z(sp)..., nearest_obstacles(pomdp, sp)..., nearest_goals(pomdp, sp)..., t(sp)]
+    o = shape_state_as_obs(pomdp, sp, o_x)
+    # o = [o_x..., z(sp)..., nearest_obstacles(pomdp, sp)..., nearest_goals(pomdp, sp)..., t(sp)]
 
     # compute reward for reaching the next state (first output of the MDP's defined objective function)
     r = pomdp.obj(sp)[1]

@@ -18,8 +18,9 @@ using CUDA, cuDNN
 using Crux
 
 # Utilizing Gen for generative approach to particle filters
-using Gen: @gen, Distribution, UnknownChange, categorical, choicemap
+using Gen: @gen, Distribution, UnknownChange, categorical, choicemap, get_choice, get_choices, get_retval
 using GenParticleFilters: pf_initialize, pf_rejuvenate!, pf_resample!, pf_update!, effective_sample_size, select, mh
+using GenParticleFilters: get_traces, get_log_weights
 import Gen
 
 # Save data
@@ -479,6 +480,64 @@ function particle_filter(observations, π_dist, start_state, n_particles, ess_th
     return state
 end
 
+
+"""
+    top_objectives(pf_state; key_fn=default_key_fn, topk=10)
+
+Return the top objectives (keys) by posterior probability mass.
+
+Arguments
+- pf_state: particle filter state (GenParticleFilters PF state or a struct with `particles`/`log_weights`)
+- key_fn(trace) -> key: extracts an "objective identity" from a trace
+- topk: number of objectives to return
+
+Returns
+- Vector of NamedTuples: [(key=..., prob=..., count=...), ...] sorted by prob desc
+"""
+function top_objectives(pf_state; key_fn = tr -> get_choice(tr, :idx), topk::Int = 10)
+    traces = get_traces(pf_state)
+    logw   = get_log_weights(pf_state)
+
+    # ---- robust weight normalization ----
+    finite_mask = isfinite.(logw)
+    if !any(finite_mask)
+        # All particles have -Inf log weight -> no meaningful posterior
+        return NamedTuple[]
+    end
+
+    lw = logw[finite_mask]
+    tr = traces[finite_mask]
+
+    m = maximum(lw)
+    w = exp.(lw .- m)
+    Z = sum(w)
+    if !(Z > 0.0) || !isfinite(Z)
+        return NamedTuple[]
+    end
+    p = w ./ Z
+
+    # aggregate posterior mass
+    mass   = Dict{Any,Float64}()
+    counts = Dict{Any,Int}()
+
+    @inbounds for i in eachindex(traces)
+        k = key_fn(traces[i])
+        mass[k]   = get(mass, k, 0.0) + p[i]
+        counts[k] = get(counts, k, 0) + 1
+    end
+
+    # sort by posterior mass
+    keys_sorted = sort(collect(keys(mass)), by = k -> mass[k], rev = true)
+
+    K = min(topk, length(keys_sorted))
+    return [
+        (key = k,
+         prob = mass[k],
+         count = counts[k])
+        for k in keys_sorted[1:K]
+    ]
+end
+
 ################
 ### Plotting ###
 ################
@@ -538,12 +597,40 @@ end
 ### Scripting ###
 #################
 
+"""
+
+Helper for cleaning up older data in ways necessary to keep code running.
+"""
+function data_cleaner(data::ExperienceBuffer, state_field_sizes::Vector{Int64}=[2, 2, 12, 10, 1], keep_state_fields::Vector{Bool}=Bool[1,1,1,0,1])
+    # verify elements keeps right size
+    actual_size = size(data.data[:s])[2]
+    if data.elements ≠ actual_size
+        data.elements = actual_size
+    end
+
+    # clean state and next-state vectors
+    idx = 1
+    keep_idxs = []
+    for (i, field_size) in enumerate(state_field_sizes)
+        if keep_state_fields[i]
+            append!(keep_idxs, idx:(idx+field_size-1))
+        end
+        idx += field_size
+    end
+    data.data[:s] = data.data[:s][keep_idxs, :]
+    data.data[:sp] = data.data[:sp][keep_idxs, :]
+
+    return data
+end
+
 println("Directory is: ", @__DIR__)
 
 script_dir = @__DIR__
 
 (kworld, data, anon_data) = BSON.load(script_dir*"/single_start_exp.bson")[:data]
-anon_data.elements = 996 # manual edit of this specific data file to account for empty end values
+data = data_cleaner(data, [2,2,12,10,1], Bool[1,1,1,0,1])
+anon_data = data_cleaner(anon_data, [2,2,12,10,1], Bool[1,1,1,0,1])
+# anon_data.elements = 996 # manual edit of this specific data file to account for empty end values
 
 π_iql, 𝒟_iql, mdp, f = quick_IQL(kworld, anon_data; plot_metrics=false)
 action_list = [actions(mdp), a->Flux.onehot(a, actions(mdp)), Flux.onehotbatch(actions(mdp), actions(mdp))]

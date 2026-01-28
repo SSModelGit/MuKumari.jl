@@ -130,218 +130,282 @@ function nearest_k_geometries(loc::Matrix, geometries::Vector, k::Integer)
     return distance_list[1:k], field_count
 end
 
+# """
+#     nearest_k_maxima(pomdp::KAgentPOMDP, s::KAgentState, objective_func::Function, k::Integer; r=10.0, n=201)
 
-"""
-    nearest_k_maxima(loc::Matrix, objective_func::Function, k::Integer)
+# Dense-grid search for local maxima of a scalar objective function around `loc`.
+# If an octant bin has zero detected interior maxima, attempt a pseudo-maximum on the octant bisector using
+# `clip_bisector_endpoint` and a 1-step monotone check along the ray.
 
-Dense-grid search for local maxima of a scalar objective function around `loc`.
+# Inputs
+# - s::KAgentState: agent location as a 1×2 matrix, e.g. [x y]
+# - objective_func::Function: scalar field objective; accepts KAgentState.
+# - k::Integer: number of nearest maxima to return
+# - r::Float64: search half-width in each direction
+# - n::Integer: grid points per axis (odd gives a center point)
 
-Inputs
-- s::KAgentState: agent location as a 1×2 matrix, e.g. [x y]
-- objective_func::Function: scalar field objective; accepts KAgentState.
-- k::Integer: number of nearest maxima to return
-- r::Float64: search half-width in each direction
-- n::Integer: grid points per axis (odd gives a center point)
+# Returns
+# - NamedTuple:
+#     (vectors, distances, counts, maxima_xy)
 
-Returns
-- NamedTuple:
-    (vectors, distances, counts, maxima_xy)
+#     vectors   :: Vector{SVector{2,Float64}}  # Δx,Δy to k nearest maxima (globally)
+#     distances :: Vector{Float64}             # Euclidean norms of vectors
+#     counts    :: Vector{Int} length 8        # number of maxima in each angular quadrant
+#     maxima_xy :: Matrix{Float64} (nmax × 2)  # all maxima locations found (x,y)
 
-    vectors   :: Vector{SVector{2,Float64}}  # Δx,Δy to k nearest maxima (globally)
-    distances :: Vector{Float64}             # Euclidean norms of vectors
-    counts    :: Vector{Int} length 8        # number of maxima in each angular quadrant
-    maxima_xy :: Matrix{Float64} (nmax × 2)  # all maxima locations found (x,y)
+# Quadrant convention (8 bins):
+# - Compute θ = atan(Δy, Δx) in [-π, π)
+# - Bin index b = floor((θ + π) / (2π/8)) + 1 ∈ {1..8}
+# """
+# function nearest_k_maxima(pomdp::KAgentPOMDP,
+#                           s::KAgentState,
+#                           objective_func::Function,
+#                           k::Integer;
+#                           r::Float64=10.0,
+#                           n::Integer=201)
 
-Quadrant convention (8 bins):
-- Compute θ = atan(Δy, Δx) in [-π, π)
-- Bin index b = floor((θ + π) / (2π/8)) + 1 ∈ {1..8}
-"""
-function nearest_k_maxima(s::KAgentState, objective_func::Function, k::Integer; r::Float64=10.0, n::Integer=201)
-    x0, y0 = s.x
+#     # Agent location (your codebase: s.x is 1×2 and destructuring works)
+#     x0, y0 = s.x
 
-    # ---- Mesh coverage + density ----
-    xs = range(x0 - r, x0 + r; length=n)
-    ys = range(y0 - r, y0 + r; length=n)
+#     # Grid
+#     xs = range(x0 - r, x0 + r; length=n)
+#     ys = range(y0 - r, y0 + r; length=n)
 
-    # Robust objective evaluation adapter:
-    # Try f(x,y), then f([x,y]), then f(reshape([x,y],1,2))
-    eval_obj(x, y) = objective_func(pseudo_agent_placement(s, reshape([x, y], 1, 2)))
+#     # Evaluate objective at arbitrary location by pseudo-placing the agent.
+#     # (Pseudo placement helper exists in MuKumari.) :contentReference[oaicite:3]{index=3}
+#     eval_obj(x, y) = objective_func(pseudo_agent_placement(s, reshape([x, y], 1, 2)))
 
-    # ---- Evaluate field on grid ----
-    F = Array{Float64}(undef, n, n)
-    @inbounds for i in 1:n
-        xi = xs[i]
-        for j in 1:n
-            F[i, j] = eval_obj(xi, ys[j])
-        end
-    end
+#     # Field samples
+#     F = Array{Float64}(undef, n, n)
+#     @inbounds for i in 1:n
+#         xi = xs[i]
+#         for j in 1:n
+#             F[i, j] = float(eval_obj(xi, ys[j]))
+#         end
+#     end
 
-    # ---- Detect local maxima (8-neighborhood) ----
-    # A point is a strict maximum if it is > all neighbors (avoids plateau explosion).
-    max_is = Int[]
-    max_js = Int[]
-    @inbounds for i in 2:(n-1)
-        for j in 2:(n-1)
-            v = F[i, j]
-            # strict compare against 8 neighbors
-            if v > F[i-1, j-1] && v > F[i-1, j] && v > F[i-1, j+1] &&
-               v > F[i,   j-1]                 && v > F[i,   j+1] &&
-               v > F[i+1, j-1] && v > F[i+1, j] && v > F[i+1, j+1]
-                push!(max_is, i)
-                push!(max_js, j)
-            end
-        end
-    end
+#     # Strict interior maxima (8-neighborhood)
+#     max_is = Int[]
+#     max_js = Int[]
+#     @inbounds for i in 2:(n-1)
+#         for j in 2:(n-1)
+#             v = F[i, j]
+#             if v > F[i-1, j-1] && v > F[i-1, j] && v > F[i-1, j+1] &&
+#                v > F[i,   j-1]                 && v > F[i,   j+1] &&
+#                v > F[i+1, j-1] && v > F[i+1, j] && v > F[i+1, j+1]
+#                 push!(max_is, i)
+#                 push!(max_js, j)
+#             end
+#         end
+#     end
 
-    nmax = length(max_is)
-    maxima_xy = Matrix{Float64}(undef, nmax, 2)
-    @inbounds for t in 1:nmax
-        maxima_xy[t, 1] = xs[max_is[t]]
-        maxima_xy[t, 2] = ys[max_js[t]]
-    end
+#     # Convert maxima indices to coordinates
+#     nmax = length(max_is)
+#     maxima_xy = Matrix{Float64}(undef, nmax, 2)
+#     @inbounds for t in 1:nmax
+#         maxima_xy[t, 1] = xs[max_is[t]]
+#         maxima_xy[t, 2] = ys[max_js[t]]
+#     end
 
-    # ---- Bin maxima into 8 angular quadrants and compute vectors/distances ----
-    counts = zeros(Int, 8)
+#     # Bin into 8 octants + store vector/distances
+#     counts = zeros(Int, 8)
+#     dxs    = Vector{Float64}(undef, nmax)
+#     dys    = Vector{Float64}(undef, nmax)
+#     dists  = Vector{Float64}(undef, nmax)
 
-    # store vectors/distances to all maxima
-    dxs = Vector{Float64}(undef, nmax)
-    dys = Vector{Float64}(undef, nmax)
-    dists = Vector{Float64}(undef, nmax)
+#     bin_width = 2π / 8
+#     @inbounds for t in 1:nmax
+#         dx = maxima_xy[t, 1] - x0
+#         dy = maxima_xy[t, 2] - y0
+#         dxs[t] = dx
+#         dys[t] = dy
+#         d = hypot(dx, dy)
+#         dists[t] = d
 
-    bin_width = 2π / 8
+#         if d == 0.0
+#             counts[1] += 1
+#         else
+#             θ = atan(dy, dx)  # [-π, π)
+#             b = Int(floor((θ + π) / bin_width)) + 1
+#             b = (b > 8) ? 8 : b
+#             counts[b] += 1
+#         end
+#     end
 
-    @inbounds for t in 1:nmax
-        dx = maxima_xy[t, 1] - x0
-        dy = maxima_xy[t, 2] - y0
-        dxs[t] = dx
-        dys[t] = dy
-        d = hypot(dx, dy)
-        dists[t] = d
+#     # ------------------------------------------------------------
+#     # Pseudo-max addendum (only for bins with zero interior maxima)
+#     # ------------------------------------------------------------
+#     # One-step "preceding point" step size along the ray:
+#     # Use ~one grid cell (conservative).
+#     Δ = 0.5 * min(xs[2] - xs[1], ys[2] - ys[1])
 
-        # If a maximum coincides with loc (rare), assign to bin 1 by convention.
-        if d == 0.0
-            counts[1] += 1
-        else
-            θ = atan(dy, dx)  # [-π, π)
-            b = Int(floor((θ + π) / bin_width)) + 1
-            # Numerical guard: θ=π maps to bin 9; wrap to 8
-            b = (b > 8) ? 8 : b
-            counts[b] += 1
-        end
-    end
+#     # For dedup (snap-to-grid indices)
+#     seen = Set{Tuple{Int,Int}}((max_is[t], max_js[t]) for t in 1:nmax)
 
-    # ---- Select k nearest maxima (globally) ----
-    if nmax == 0
-        return (vectors = Vector{NTuple{2,Float64}}(),
-                distances = Float64[],
-                counts = counts,
-                maxima_xy = maxima_xy)
-    end
+#     # Snap an (x,y) to nearest grid indices
+#     function nearest_grid_index(x::Float64, y::Float64)
+#         dxg = xs[2] - xs[1]
+#         dyg = ys[2] - ys[1]
+#         i = Int(round((x - xs[1]) / dxg)) + 1
+#         j = Int(round((y - ys[1]) / dyg)) + 1
+#         return clamp(i, 1, n), clamp(j, 1, n)
+#     end
 
-    # Partial sort indices by distance
-    kk = min(k, nmax)
-    ord = partialsortperm(dists, 1:kk)
+#     for b in 1:8
+#         counts[b] != 0 && continue  # only if no maxima in that octant
 
-    vectors = Vector{NTuple{2,Float64}}(undef, kk)
-    nearest_dists = Vector{Float64}(undef, kk)
-    @inbounds for ii in 1:kk
-        t = ord[ii]
-        vectors[ii] = (dxs[t], dys[t])
-        nearest_dists[ii] = dists[t]
-    end
+#         # Bisector angle for octant b
+#         θc = -π + (b - 0.5) * bin_width
+#         ux = cos(θc)
+#         uy = sin(θc)
 
-    return (vectors = vectors,
-            distances = nearest_dists,
-            counts = counts,
-            maxima_xy = maxima_xy)
-end
+#         # Ray endpoint (may lie outside); clip to box boundary using your routine
+#         p0 = reshape([x0, y0], 1, 2)
+#         p1 = reshape([x0 + r*ux, y0 + r*uy], 1, 2)
+#         p_saved = clip_bisector_endpoint(pomdp, p0, p1)  # uses pomdp.dimensions :contentReference[oaicite:4]{index=4}
 
-# One-shot "slide-to-box" for a bisector ray endpoint, written in matrix form.
-# Points are 1×2 matrices: p[1,1]=x, p[1,2]=y
-#
-# Assumptions:
-# - Box boundary is axis-aligned: [d1,d2] × [d1,d2]
-# - Ray is along one of 8 bisectors: slope ∈ {0, ±1, ±∞}
-# Convention:
-# - If both x and y violate bounds, resolve x first.
+#         xsaved = float(p_saved[1,1])
+#         ysaved = float(p_saved[1,2])
 
-function clip_bisector_endpoint(pomdp::KAgentPOMDP, p0::Matrix, p1::Matrix)
-    d1 = float(pomdp.dimensions[1])
-    d2 = float(pomdp.dimensions[2])
+#         # Preceding point along the ray direction
+#         xprev = xsaved - Δ*ux
+#         yprev = ysaved - Δ*uy
 
-    @inline inbounds(p) = (d1 ≤ p[1,1] ≤ d2 ? 0 : 2) + (d1 ≤ p[1,2] ≤ d2 ? 0 : 1)
+#         v_saved = float(eval_obj(xsaved, ysaved))
+#         v_prev  = float(eval_obj(xprev,  yprev))
 
-    inbound_check = inbounds(p1)
-    # Fast path
-    if inbound_check == 0
-        return p1
-    end
+#         # Pseudo-max criterion: objective increases as we move toward boundary point
+#         if v_prev < v_saved
+#             ib, jb = nearest_grid_index(xsaved, ysaved)
+#             if !((ib, jb) in seen)
+#                 push!(max_is, ib)
+#                 push!(max_js, jb)
+#                 push!(seen, (ib, jb))
 
-    # Direction and slope
-    d = p1 .- p0
-    dx = d[1,1]
-    dy = d[1,2]
-    m  = (dx == 0.0) ? Inf : (dy / dx)
+#                 # append to maxima_xy and distance arrays
+#                 maxima_xy = vcat(maxima_xy, reshape([xs[ib], ys[jb]], 1, 2))
+#                 push!(dxs, xs[ib] - x0)
+#                 push!(dys, ys[jb] - y0)
+#                 push!(dists, hypot(dxs[end], dys[end]))
+#                 counts[b] += 1
+#             end
+#         end
+#     end
 
-    # We compute p2 by fixing one coordinate to the violated boundary and sliding the other.
-    p2 = copy(p1)
+#     # Refresh nmax after pseudo additions
+#     nmax = size(maxima_xy, 1)
 
-    if inbound_check ≥ 2
-        # Fix x first (also when both violated)
-        xB = (p1[1,1] < d1) ? d1 : d2
-        Δx = xB - p1[1,1]
-        p2[1,1] = xB
+#     # Select k nearest maxima (globally)
+#     if nmax == 0
+#         return (vectors = Vector{NTuple{2,Float64}}(),
+#                 distances = Float64[],
+#                 counts = counts,
+#                 maxima_xy = maxima_xy)
+#     end
 
-        if isfinite(m)
-            p2[1,2] = p1[1,2] + m * Δx
-        else
-            # vertical ray: x shouldn't be the violated dimension when moving from inside,
-            # but keep y unchanged as a safe fallback.
-            p2[1,2] = clamp(p1[1,2], d1, d2)
-        end
+#     kk  = min(k, nmax)
+#     ord = partialsortperm(dists, 1:kk)
 
-        # If y still violates, fix y and slide x (second and final slide)
-        if p2[1,2] < d1 || p2[1,2] > d2
-            yB = (p2[1,2] < d1) ? d1 : d2
-            Δy = yB - p2[1,2]
-            p2[1,2] = yB
+#     vectors = Vector{NTuple{2,Float64}}(undef, kk)
+#     nearest_dists = Vector{Float64}(undef, kk)
+#     @inbounds for ii in 1:kk
+#         t = ord[ii]
+#         vectors[ii] = (dxs[t], dys[t])
+#         nearest_dists[ii] = dists[t]
+#     end
 
-            if (abs(m) < 1e-12) || !isfinite(m)
-                # horizontal: x unchanged
-                p2[1,1] = p2[1,1]
-            else
-                p2[1,1] = p2[1,1] + (Δy / m)
-            end
-        end
+#     return (vectors = vectors,
+#             distances = nearest_dists,
+#             counts = counts,
+#             maxima_xy = maxima_xy)
+# end
 
-    else
-        # y violated (and x not violated): fix y first
-        yB = (p1[1,2] < d1) ? d1 : d2
-        Δy = yB - p1[1,2]
-        p2[1,2] = yB
+# # One-shot "slide-to-box" for a bisector ray endpoint, written in matrix form.
+# # Points are 1×2 matrices: p[1,1]=x, p[1,2]=y
+# #
+# # Assumptions:
+# # - Box boundary is axis-aligned: [d1,d2] × [d1,d2]
+# # - Ray is along one of 8 bisectors: slope ∈ {0, ±1, ±∞}
+# # Convention:
+# # - If both x and y violate bounds, resolve x first.
 
-        if abs(m) < 1e-12 || !isfinite(m)
-            # horizontal / vertical ray: y constant; keep x
-            p2[1,1] = clamp(p1[1,1], d1, d2)
-        else
-            p2[1,1] = p1[1,1] + (Δy / m)
-        end
+# function clip_bisector_endpoint(pomdp::KAgentPOMDP, p0::Matrix, p1::Matrix)
+#     d1 = float(pomdp.dimensions[1])
+#     d2 = float(pomdp.dimensions[2])
 
-        # If x now violates, fix x and slide y (second and final slide)
-        if p2[1,1] < d1 || p2[1,1] > d2
-            xB = (p2[1,1] < d1) ? d1 : d2
-            Δx = xB - p2[1,1]
-            p2[1,1] = xB
+#     @inline inbounds(p) = (d1 ≤ p[1,1] ≤ d2 ? 0 : 2) + (d1 ≤ p[1,2] ≤ d2 ? 0 : 1)
 
-            if isfinite(m)
-                p2[1,2] = p2[1,2] + m * Δx
-            else
-                # vertical: y unchanged
-                p2[1,2] = p2[1,2]
-            end
-        end
-    end
+#     inbound_check = inbounds(p1)
+#     # Fast path
+#     if inbound_check == 0
+#         return p1
+#     end
 
-    # Final safety clamp (avoid weird floating point issues this way)
-    return [clamp(p2[1,1], d1, d2) clamp(p2[1,2], d1, d2)]
-end
+#     # Direction and slope
+#     d = p1 .- p0
+#     dx = d[1,1]
+#     dy = d[1,2]
+#     m  = (dx == 0.0) ? Inf : (dy / dx)
+
+#     # We compute p2 by fixing one coordinate to the violated boundary and sliding the other.
+#     p2 = copy(p1)
+
+#     if inbound_check ≥ 2
+#         # Fix x first (also when both violated)
+#         xB = (p1[1,1] < d1) ? d1 : d2
+#         Δx = xB - p1[1,1]
+#         p2[1,1] = xB
+
+#         if isfinite(m)
+#             p2[1,2] = p1[1,2] + m * Δx
+#         else
+#             # vertical ray: x shouldn't be the violated dimension when moving from inside,
+#             # but keep y unchanged as a safe fallback.
+#             p2[1,2] = clamp(p1[1,2], d1, d2)
+#         end
+
+#         # If y still violates, fix y and slide x (second and final slide)
+#         if p2[1,2] < d1 || p2[1,2] > d2
+#             yB = (p2[1,2] < d1) ? d1 : d2
+#             Δy = yB - p2[1,2]
+#             p2[1,2] = yB
+
+#             if (abs(m) < 1e-12) || !isfinite(m)
+#                 # horizontal: x unchanged
+#                 p2[1,1] = p2[1,1]
+#             else
+#                 p2[1,1] = p2[1,1] + (Δy / m)
+#             end
+#         end
+
+#     else
+#         # y violated (and x not violated): fix y first
+#         yB = (p1[1,2] < d1) ? d1 : d2
+#         Δy = yB - p1[1,2]
+#         p2[1,2] = yB
+
+#         if abs(m) < 1e-12 || !isfinite(m)
+#             # horizontal / vertical ray: y constant; keep x
+#             p2[1,1] = clamp(p1[1,1], d1, d2)
+#         else
+#             p2[1,1] = p1[1,1] + (Δy / m)
+#         end
+
+#         # If x now violates, fix x and slide y (second and final slide)
+#         if p2[1,1] < d1 || p2[1,1] > d2
+#             xB = (p2[1,1] < d1) ? d1 : d2
+#             Δx = xB - p2[1,1]
+#             p2[1,1] = xB
+
+#             if isfinite(m)
+#                 p2[1,2] = p2[1,2] + m * Δx
+#             else
+#                 # vertical: y unchanged
+#                 p2[1,2] = p2[1,2]
+#             end
+#         end
+#     end
+
+#     # Final safety clamp (avoid weird floating point issues this way)
+#     return [clamp(p2[1,1], d1, d2) clamp(p2[1,2], d1, d2)]
+# end
