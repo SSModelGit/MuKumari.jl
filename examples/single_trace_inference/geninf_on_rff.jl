@@ -117,6 +117,21 @@ function quick_IQL(kworld::KWorld, anon_data::ExperienceBuffer; plot_metrics::Bo
     return π_iql, 𝒟_iql, mdp, f
 end
 
+function quick_IQL(mdp::KAgentPOMDP, anon_data::ExperienceBuffer)
+    N = anon_data.elements
+    as = actions(mdp)
+    S = state_space(mdp)
+    γ = Float32(discount(mdp))
+
+    A() = DiscreteNetwork(Chain(Dense(S.dims[1], 64, relu), Dense(64, 64, relu), Dense(64, length(as))), as; dev=Flux.cpu)
+
+    𝒟_iql = OnlineIQLearn(π=A(), 𝒟_demo=anon_data, S=S, γ=γ, N=anon_data.elements, ΔN=1, c_opt=(;epochs=1),reg=false,gp=false, log=(;period=50))
+
+    π_iql = solve(𝒟_iql, mdp)
+
+    return π_iql, 𝒟_iql, mdp, f
+end
+
 #################################
 # Fourier-mode parameter sampling
 #################################
@@ -1236,31 +1251,329 @@ function plot_objective_side_by_side(pf_state, π_dist::ScoreΠDist;
     return plot(p1, p2; layout=(1,2))
 end
 
-#########################
-### Example call-sites ###
-#########################
+###############
+### Testing ###
+###############
 
-# After running:
-#   filter_state = particle_filter(...)
-# You likely have:
-#   mdp           :: KAgentPOMDP        (observed)
-#   agent_params  :: Dict              (constructed from mdp, includes :start_state)
-#   data.data[:s] :: Matrix (features × T)
-#
-# Example: plot inferred heatmap + observed vs predicted trajectories over first 12 steps
-#
-# observed_state_matrix = data.data[:s][:, 1:12]
-# p_traj = plot_top_objective_with_trajectories(filter_state, π_dist, agent_params;
-#                                               observed_state_matrix=observed_state_matrix,
-#                                               gridsize=160,
-#                                               xy_rows=(1,2),
-#                                               show_predicted=true,
-#                                               title_prefix="Top inferred objective")
-# display(p_traj)
-#
-# Example: side-by-side objective sanity check
-# p_side = plot_objective_side_by_side(filter_state, π_dist; observed_mdp=mdp, gridsize=160)
-# display(p_side)
+using BSON
+using LinearAlgebra
+
+############################
+# Single “run data” struct #
+############################
+
+struct RunPack
+    run_id::Int                 # top-level run index in the BSON
+    agent::String               # "ag1".."ag7"
+    inst::Int                   # instance index (k)
+    mdp::Any                    # KAgentPOMDP
+    full::Any                   # ExperienceBuffer (full)
+    anon::Any                   # ExperienceBuffer (anon; used for IQL)
+    ann::NamedTuple             # (num_goals, num_obstacles, max_goal_separation)
+end
+
+##########################
+# Minimal annotations API
+##########################
+
+# robust target extraction: goals look like (:aer, Dict(:target=>[x,y], ...))
+function _goal_targets(goals)
+    ts = Vector{Vector{Float64}}()
+    for g in goals
+        d = g[2]
+        if d isa Dict && haskey(d, :target)
+            push!(ts, vec(Float64.(d[:target])))
+        end
+    end
+    return ts
+end
+
+function _max_pairwise_dist(X::Vector{Vector{Float64}})
+    n = length(X)
+    n ≤ 1 && return 0.0
+    best = 0.0
+    @inbounds for i in 1:n, j in (i+1):n
+        best = max(best, norm(X[i] .- X[j]))
+    end
+    return best
+end
+
+function kworld_annotations(kworld)
+    gl = getproperty(kworld, :glob_landscape)
+    goals = getproperty(gl, :goals)
+    obcs  = getproperty(gl, :obstacles)
+    return (
+        num_goals = length(goals),
+        num_obstacles = length(obcs),
+        max_goal_separation = _max_pairwise_dist(_goal_targets(goals))
+    )
+end
+
+#################################
+# BSON -> Vector{RunPack} loader
+#################################
+
+# Supports:
+#  - stored as raw[:data] = (kworld, dataDict)
+#  - stored as raw[:runs] = [ ... ]  (each a run dict or (kworld,data))
+function _normalize_run_payload(x)
+    if x isa Tuple && length(x) == 2
+        kw, d = x
+        d isa Dict || error("Expected (kworld, Dict) in run payload.")
+        dd = deepcopy(d)
+        dd["kworld"] = kw
+        return dd
+    end
+    x isa Dict || error("Expected Dict run payload.")
+    return x
+end
+
+function load_runpacks(bson_path::AbstractString)
+    raw = BSON.load(bson_path)
+
+    runs =
+        haskey(raw, :runs)  ? raw[:runs]  :
+        haskey(raw, "runs") ? raw["runs"] :
+        haskey(raw, :data)  ? [raw[:data]] :
+        haskey(raw, "data") ? [raw["data"]] :
+        [raw]
+
+    packs = RunPack[]
+    for (rid, r0) in enumerate(runs)
+        run = _normalize_run_payload(r0)
+
+        kworld = haskey(run, "kworld") ? run["kworld"] :
+                 haskey(run, :kworld)  ? run[:kworld]  :
+                 error("No kworld in run $rid")
+
+        ann = kworld_annotations(kworld)
+
+        # agent keys are Strings like "ag1".."ag7"
+        agent_keys = sort([k for k in keys(run) if k isa String && startswith(k, "ag")])
+
+        for agent in agent_keys
+            expdict = run[agent]  # Dict(:ind_exps=>..., :total_exp=>...)
+            insts = expdict[:ind_exps]
+
+            for k in 1:length(insts)
+                full_buf, anon_buf = insts[k]
+                name = agent * "_" * string(k)
+                mdp  = kworld.inhabitants[name]  # matches generator naming
+                push!(packs, RunPack(rid, agent, k, mdp, full_buf, anon_buf, ann))
+            end
+        end
+    end
+    return packs
+end
+
+#######################################
+# Evaluation core (two “modes” of PF)
+#######################################
+
+# results are returned as NamedTuples for easy downstream processing
+# (keeps code compact; no separate Result type required)
+function eval_pack(pack::RunPack;
+                   n_particles::Int=50,
+                   ess_thresh::Float64=0.7,
+                   refine_every::Int=5,
+                   refine_topk::Int=5,
+                   real_T::Int=12,
+                   iql_gridN::Int=400)
+
+    mdp = pack.mdp
+
+    # 1) train IQL on anon buffer (your quick_IQL expects kworld in some scripts;
+    #    if your version accepts only anon_data, swap accordingly)
+    # In geninf_on_rff.jl, quick_IQL(kworld, anon_data) trains using mdp=get_agent(kworld,"ag1").
+    # For per-instance mdp training, prefer your per-mdp IQL helper if you have it.
+    # Here we use a minimal per-mdp pattern (works if OnlineIQLearn etc already imported):
+    π_iql, 𝒟_iql, _, _ = quick_IQL(mdp, pack.anon)  # <- if this is not valid in your env, replace with your per-mdp IQL trainer
+
+    # 2) build π_dist action mappings from this mdp’s action set
+    as = actions(mdp)
+    action_list = [as, a->Flux.onehot(a, as), Flux.onehotbatch(as, as)]
+    π_dist = ScoreΠDist(; mdp_params=action_list)
+
+    # 3) agent_params from mdp
+    agent_params = agent_params_from_mdp(mdp)
+
+    ########################
+    # Mode A: real dataset
+    ########################
+    # PF uses (state_data[:,1:T], aidx[1:T]) from the full buffer
+    state_data = pack.full.data[:s][:, 1:real_T]
+    obs_aidx   = onehot_cols_to_aidx(pack.full.data[:a][:, 1:real_T])
+
+    pf_real = particle_filter(obs_aidx, π_dist, agent_params, state_data, n_particles;
+                              ess_thresh=ess_thresh, refine_every=refine_every, refine_topk=refine_topk)
+
+    ###############################
+    # Mode B: IQL grid surrogate PF
+    ###############################
+    iql_state_data, iql_obs_aidx, _ = surrogate_dataset_from_iql_grid(π_dist, π_iql, mdp; eval_num=iql_gridN)
+
+    pf_iql = particle_filter(iql_obs_aidx, π_dist, agent_params, iql_state_data, n_particles;
+                             ess_thresh=ess_thresh, refine_every=refine_every, refine_topk=refine_topk)
+
+    return (
+        pack = pack,
+        mdp = mdp,
+        agent_params = agent_params,
+        π_dist = π_dist,
+        π_iql = π_iql,
+        pf_real = pf_real,
+        pf_iql  = pf_iql,
+        real = (state_data=state_data, obs_aidx=obs_aidx),
+        iql  = (state_data=iql_state_data, obs_aidx=iql_obs_aidx)
+    )
+end
+
+function eval_all(packs::Vector{RunPack}; kwargs...)
+    out = Vector{Any}(undef, length(packs))
+    for i in eachindex(packs)
+        out[i] = eval_pack(packs[i]; kwargs...)
+    end
+    return out
+end
+
+#############################
+# Metrics (compact + useful)
+#############################
+
+# --- degeneracy ---
+function pf_degeneracy(pf_state, π_dist; n_particles::Int)
+    logw = get_log_weights(pf_state)
+    finite = isfinite.(logw)
+    all_ninf = !any(finite)
+
+    tops = top_objectives(pf_state, π_dist; topk=5)
+    nunique = length(tops)
+    collapsed = (nunique == 1) && (!isempty(tops)) && (tops[1].count == n_particles)
+
+    return (all_logw_ninf=all_ninf, nunique=nunique, collapsed=collapsed, ess=effective_sample_size(pf_state))
+end
+
+# --- objective reconstruction: z-scored RMSE + correlation on a grid ---
+function _zscore(Z)
+    μ = mean(Z)
+    σ = std(vec(Z))
+    σ = (σ ≤ 1e-12) ? 1.0 : σ
+    return (Z .- μ) ./ σ
+end
+
+function objective_recon_metrics(pf_state, π_dist, mdp; gridsize::Int=120)
+    tops = top_objectives(pf_state, π_dist; topk=1)
+    isempty(tops) && return (rmse_z=NaN, corr=NaN)
+
+    key = tops[1].key
+    ff = decode_fourier_key(key, π_dist.fourier_cfg)
+    field = make_fourier_scalar_field(ff; scaleQ=true)
+
+    lo, hi = mdp.dimensions
+    xs = range(lo, hi; length=gridsize)
+    ys = range(lo, hi; length=gridsize)
+
+    Zhat  = Matrix{Float64}(undef, length(ys), length(xs))
+    Ztrue = Matrix{Float64}(undef, length(ys), length(xs))
+
+    @inbounds for (j,y) in enumerate(ys), (i,x) in enumerate(xs)
+        Zhat[j,i] = field(x,y)
+        s = blindstart_KAgentState(mdp, [x y])
+        Ztrue[j,i] = Float64(mdp.obj(s)[1])
+    end
+
+    A = vec(_zscore(Zhat))
+    B = vec(_zscore(Ztrue))
+    rmse = sqrt(mean((A .- B).^2))
+    corr = dot(A,B) / (norm(A)*norm(B) + 1e-12)
+    return (rmse_z=rmse, corr=corr)
+end
+
+# --- “policy matches true actions at true states” for top key (greedy argmax) ---
+function policy_match_acc(pf_state, π_dist, agent_params, state_data, obs_aidx; temperature::Float64=1.0)
+    tops = top_objectives(pf_state, π_dist; topk=1)
+    isempty(tops) && return (acc=NaN, N=0)
+    key = tops[1].key
+    mdp_hat = ensure_mdp!(π_dist, key)
+
+    T = length(obs_aidx)
+    pred = Vector{Int}(undef, T)
+    @inbounds for t in 1:T
+        s = blindstart_KAgentState(mdp_hat, reshape(state_data[:,t][1:2], (1,2)))
+        b = vec(proposal_boltzmann(π_dist, key, s; temperature=temperature))
+        pred[t] = argmax(b)
+    end
+    return (acc=mean(pred .== obs_aidx), N=T)
+end
+
+##############################################
+# Aggregate per-pack results into compact rows
+##############################################
+
+function summarize_eval(evals; n_particles::Int, gridsize::Int=120)
+    rows_real = NamedTuple[]
+    rows_iql  = NamedTuple[]
+
+    for E in evals
+        pack = E.pack
+        ann  = pack.ann
+
+        # Real-mode metrics
+        degR = pf_degeneracy(E.pf_real, E.π_dist; n_particles=n_particles)
+        objR = objective_recon_metrics(E.pf_real, E.π_dist, E.mdp; gridsize=gridsize)
+        polR = policy_match_acc(E.pf_real, E.π_dist, E.agent_params, E.real.state_data, E.real.obs_aidx;
+                                temperature=get(E.agent_params, :policy_temperature, 1.0))
+
+        push!(rows_real, (
+            run_id=pack.run_id, agent=pack.agent, inst=pack.inst,
+            num_goals=ann.num_goals, num_obstacles=ann.num_obstacles, max_goal_sep=ann.max_goal_separation,
+            obj_rmse_z=objR.rmse_z, obj_corr=objR.corr,
+            policy_acc=polR.acc, policy_N=polR.N,
+            deg_all_ninf=degR.all_logw_ninf, deg_nunique=degR.nunique, deg_collapsed=degR.collapsed, ess=degR.ess
+        ))
+
+        # IQL-surrogate-mode metrics (policy_acc computed against surrogate actions at surrogate states)
+        degI = pf_degeneracy(E.pf_iql, E.π_dist; n_particles=n_particles)
+        objI = objective_recon_metrics(E.pf_iql, E.π_dist, E.mdp; gridsize=gridsize)
+        polI = policy_match_acc(E.pf_iql, E.π_dist, E.agent_params, E.iql.state_data, E.iql.obs_aidx;
+                                temperature=get(E.agent_params, :policy_temperature, 1.0))
+
+        push!(rows_iql, (
+            run_id=pack.run_id, agent=pack.agent, inst=pack.inst,
+            num_goals=ann.num_goals, num_obstacles=ann.num_obstacles, max_goal_sep=ann.max_goal_separation,
+            obj_rmse_z=objI.rmse_z, obj_corr=objI.corr,
+            policy_acc=polI.acc, policy_N=polI.N,
+            deg_all_ninf=degI.all_logw_ninf, deg_nunique=degI.nunique, deg_collapsed=degI.collapsed, ess=degI.ess
+        ))
+    end
+
+    return (real=rows_real, iql=rows_iql)
+end
+
+#####################
+# One-shot entrypoint
+#####################
+
+function multi_run_test(bson_path::AbstractString;
+                        n_particles::Int=50,
+                        ess_thresh::Float64=0.7,
+                        refine_every::Int=5,
+                        refine_topk::Int=5,
+                        real_T::Int=12,
+                        iql_gridN::Int=80,
+                        gridsize::Int=120)
+
+    packs = load_runpacks(bson_path)
+    evals = eval_all(packs;
+                     n_particles=n_particles,
+                     ess_thresh=ess_thresh,
+                     refine_every=refine_every,
+                     refine_topk=refine_topk,
+                     real_T=real_T,
+                     iql_gridN=iql_gridN)
+
+    return summarize_eval(evals; n_particles=n_particles, gridsize=gridsize)
+end
 
 
 #################
@@ -1268,6 +1581,7 @@ end
 #################
 
 """
+    data_cleaner(data::ExperienceBuffer, state_field_sizes::Vector{Int64}=[2, 2, 12, 10, 1], keep_state_fields::Vector{Bool}=Bool[1,1,1,0,1])
 
 Helper for cleaning up older data in ways necessary to keep code running.
 """
@@ -1353,7 +1667,6 @@ script_dir = @__DIR__
 (kworld, data, anon_data) = BSON.load(script_dir*"/single_start_exp.bson")[:data]
 data = data_cleaner(data, [2,2,12,10,1], Bool[1,1,1,0,1])
 anon_data = data_cleaner(anon_data, [2,2,12,10,1], Bool[1,1,1,0,1])
-# anon_data.elements = 996 # manual edit of this specific data file to account for empty end values
 
 π_iql, 𝒟_iql, mdp, f = quick_IQL(kworld, anon_data; plot_metrics=false)
 action_list = [actions(mdp), a->Flux.onehot(a, actions(mdp)), Flux.onehotbatch(actions(mdp), actions(mdp))]
@@ -1368,4 +1681,12 @@ state_data = data.data[:s][:,1:12]
 
 iql_state_data, iql_obs_aidx, iql_locs = surrogate_dataset_from_iql_grid(π_dist, π_iql, mdp; eval_num=400)
 
-filter_state = particle_filter(relevant_data, π_dist, agent_params, state_data, 100; ess_thresh=0.7)
+filter_state = particle_filter(relevant_data, π_dist, agent_params, state_data, 80; ess_thresh=0.7)
+
+tops = top_objectives(filter_state, π_dist; topk=10)
+# top objective evaluation
+p_traj = plot_top_objective_with_trajectories(filter_state, π_dist, agent_params;
+                                              observed_state_matrix=state_data, xy_rows=(1,2),
+                                              gridsize=160, show_predicted=true, title_prefix="Top inferred objective")
+# compare top objective against the true objective map
+p_side = plot_objective_side_by_side(filter_state, π_dist; observed_mdp=mdp, gridsize=160)
