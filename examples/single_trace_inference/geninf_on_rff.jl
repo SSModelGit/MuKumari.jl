@@ -6,6 +6,7 @@ using Combinatorics: powerset
 using POMDPTools, MCTS, POMDPLinter
 using Match: @match
 using Parameters: @with_kw
+import GeoInterface as GI
 
 # addressing weird load order bugs
 using Plots
@@ -18,7 +19,7 @@ using CUDA, cuDNN
 using Crux
 
 # Utilizing Gen for generative approach to particle filters
-using Gen: @gen, Distribution, UnknownChange, categorical, choicemap, get_choice, get_choices, get_retval
+using Gen: @gen, @trace, Distribution, UnknownChange, NoChange, categorical, choicemap, get_choice, get_choices, get_retval
 using GenParticleFilters: pf_initialize, pf_rejuvenate!, pf_resample!, pf_update!, effective_sample_size, select, mh
 using GenParticleFilters: get_traces, get_log_weights
 import Gen
@@ -46,20 +47,20 @@ function mcts_solver(pomdp::KAgentPOMDP; solver_params=[:van, 1000, 10.0])
 end
 
 # define Deep Q solver (REINFORCE, DQN, and SoftQ)
-function deep_q_solver(pomdp::KAgentPOMDP; solver_params=[:all, 10000])
+function deep_q_solver(pomdp::KAgentPOMDP; solver_params=[:all, 10000, 2, 512])
     as = actions(pomdp)
     S = state_space(pomdp)
     A() = Flux.gpu(DiscreteNetwork(Chain(Dense(Crux.dim(S)..., 64, relu), Dense(64, 64, relu), Dense(64, length(as))), as; dev=Flux.gpu))
     V() = Flux.gpu(ContinuousNetwork(Chain(Dense(Crux.dim(S)..., 64, relu), Dense(64, 64, relu), Dense(64, 1))))
 
-    solver_type, N = solver_params[[1, 2]] # can also do solver_params[1:2] if I wanted - keeping this as later reminder for self on how to use indexing
+    solver_type, N, epochs, batch_size = solver_params[[1, 2, 3, 4]] # can also do solver_params[1:2] if I wanted - keeping this as later reminder for self on how to use indexing
     𝒮_net = @match solver_type begin
-        :all => [REINFORCE(π=A(), S=S, N=N, ΔN=500, a_opt=(epochs=5,), interaction_storage=[]),
+        :all => [REINFORCE(π=A(), S=S, N=N, ΔN=500, a_opt=(epochs=epochs,), interaction_storage=[]),
                  DQN(π=A(), S=S, N=N, interaction_storage=[]),
-                 SoftQ(π=A(), α=Float32(0.1), S=S, N=N, ΔN=1, c_opt=(;epochs=5), interaction_storage=[])]
-        :reinforce => [REINFORCE(π=A(), S=S, N=N, ΔN=500, a_opt=(epochs=5,), interaction_storage=[])]
+                 SoftQ(π=A(), α=Float32(0.1), S=S, N=N, ΔN=1, c_opt=(;epochs=epochs, batch_size=batch_size), interaction_storage=[])]
+        :reinforce => [REINFORCE(π=A(), S=S, N=N, ΔN=500, a_opt=(epochs=epochs,), interaction_storage=[])]
         :dqn => [DQN(π=A(), S=S, N=N, interaction_storage=[])]
-        :softq => [SoftQ(π=A(), α=Float32(0.1), S=S, N=N, ΔN=1, c_opt=(;epochs=5), interaction_storage=[])]
+        :softq => [SoftQ(π=A(), α=Float32(0.1), S=S, N=N, ΔN=1, c_opt=(;epochs=epochs, batch_size=batch_size), interaction_storage=[])]
     end
 
     if !(solver_type==:all)
@@ -116,67 +117,204 @@ function quick_IQL(kworld::KWorld, anon_data::ExperienceBuffer; plot_metrics::Bo
     return π_iql, 𝒟_iql, mdp, f
 end
 
-function kworld_for_inference(possible_goals::Vector;
-                                known_kworld::Union{KWorld, Nothing}=nothing,
-                                known_obcs::Union{Vector, Nothing}=nothing,
-                                known_env::Union{MuEnv, Nothing}=nothing, dims::Union{Tuple, Nothing}=nothing)
-    if !isnothing(known_kworld)
-        known_env = known_kworld.menv
-        known_obcs = copy(known_kworld.glob_landscape.obstacles)
-        dims = kworld.dimensions
-    elseif isnothing(known_kworld) && (isnothing(known_obcs) && isnothing(known_env) && isnothing(dims))
-        @error "Have to specify EITHER a known world OR known obstacles & environment & dimensions (world will take precedent)"
-    end
+#################################
+# Fourier-mode parameter sampling
+#################################
 
-    infer_glob_landscape = GlobalObjectiveLandscape(; goals=possible_goals, obstacles=known_obcs, horizons=[])
-    println("Global Objective is: ", infer_glob_landscape)
-    pseudo_solver = MCTSSolver(n_iterations=1000, depth=20, exploration_constant=10.0) # random default solver to fill in required fields of KWorld
-    create_kworld(; solver=pseudo_solver, dims=dims, gobj=infer_glob_landscape, menv=known_env)
+@with_kw struct FourierDiscreteCfg
+    Kmax::Int = 24
+    λK::Float64 = 0.35            # P(K=k) ∝ exp(-λK*(k-1))
+
+    # frequency grid
+    Δf::Float64 = 0.1
+    Fmax_i::Int = 30              # bins in -Fmax_i:Fmax_i
+
+    # amplitude grid
+    ΔA::Float64 = 0.1
+    Amax_i::Int = 50              # bins in 0:Amax_i
+
+    # phase grid
+    P::Int = 32                   # bins in 0:P-1
+
+    # optional: bias towards lower |freq|
+    freq_mag_decay::Float64 = 0.0
 end
 
-function construct_q_proposals(infer_kworld; inf_agent_start::Matrix=[3. 3.])
-    base_objs = copy(infer_kworld.glob_landscape.goals)
-    k = length(base_objs)
-    base_obj_names = map(x->x[1], base_objs)
+@inline f_from_i(i::Int, cfg::FourierDiscreteCfg) = i * cfg.Δf
+@inline A_from_i(i::Int, cfg::FourierDiscreteCfg) = i * cfg.ΔA
+@inline ϕ_from_i(i::Int, cfg::FourierDiscreteCfg) = 2π * (i / cfg.P)
 
-    q_base = Dict([(obj, 1/k) for obj in base_obj_names])
-    q_objs = map(powerset(base_obj_names, 1)) do obj
-        q_obj = 1
-        for comp_obj in obj
-            q_obj *= q_base[comp_obj]
+"""
+    K_probs(cfg::FourierDiscreteCfg)
+
+Constructs categorical vector mapping k-count to exponential decay distribution.
+"""
+function K_probs(cfg::FourierDiscreteCfg)
+    ws = exp.(-cfg.λK .* (0:(cfg.Kmax-1)))
+    ws ./= sum(ws)
+    return ws
+end
+
+"""
+    freq_bin_support_and_probs(cfg::FourierDiscreteCfg)
+
+TODO: Constructs categorical vector mapping freq to exp decay??
+"""
+function freq_bin_support_and_probs(cfg::FourierDiscreteCfg)
+    supp = collect(-cfg.Fmax_i:cfg.Fmax_i)
+    if cfg.freq_mag_decay <= 0
+        ws = fill(1.0, length(supp))
+    else
+        ws = exp.(-cfg.freq_mag_decay .* abs.(supp))
+    end
+    ws ./= sum(ws)
+    return supp, ws
+end
+
+"""
+    amp_bin_support_and_probs(cfg::FourierDiscreteCfg)
+
+TODO: Constructs categorical vector mapping amplitude to uniform??
+"""
+function amp_bin_support_and_probs(cfg::FourierDiscreteCfg)
+    supp = collect(0:cfg.Amax_i)
+    ws = fill(1.0, length(supp))
+    ws ./= sum(ws)
+    return supp, ws
+end
+
+"""
+    phase_bin_support_and_probs(cfg::FourierDiscreteCfg)
+
+TODO: Constructs categorical vector mapping ϕ to uniform??
+"""
+function phase_bin_support_and_probs(cfg::FourierDiscreteCfg)
+    supp = collect(0:(cfg.P-1))
+    ws = fill(1.0, length(supp))
+    ws ./= sum(ws)
+    return supp, ws
+end
+
+"""
+    gen_K(cfg::FourierDiscreteCfg)
+
+Generative function to sample number of Fourier features.
+"""
+@gen function gen_K(cfg::FourierDiscreteCfg)
+    K ~ categorical(K_probs(cfg))   # returns 1..Kmax
+    return K
+end
+
+"""
+    gen_mode_indices(cfg::FourierDiscreteCfg)
+
+Generative function to sample f, A, and ϕ for a Fourier feature.
+"""
+@gen function gen_mode_indices(cfg::FourierDiscreteCfg)
+    f_supp, f_w = freq_bin_support_and_probs(cfg)
+    a_supp, a_w = amp_bin_support_and_probs(cfg)
+    p_supp, p_w = phase_bin_support_and_probs(cfg)
+
+    fx_idx ~ categorical(f_w)
+    fy_idx ~ categorical(f_w)
+    A_idx  ~ categorical(a_w)
+    ϕ_idx  ~ categorical(p_w)
+
+    return (fx_i = f_supp[fx_idx],
+            fy_i = f_supp[fy_idx],
+            A_i  = a_supp[A_idx],
+            ϕ_i  = p_supp[ϕ_idx])
+end
+
+
+"""
+    gen_fourier_bank(cfg::FourierDiscreteCfg)
+
+Composes the Fourier feature sampling process:
+* First, samples number of features to be used
+* Second, samples the parameters for each feature (f, A, ϕ).
+
+Returns a cached set of keys mapping to each feature and associated params.
+"""
+@gen function gen_fourier_bank_fixed(cfg::FourierDiscreteCfg)
+    # K in 1..Kmax
+    K = @trace(gen_K(cfg), :K)
+
+    # supports & probs (precompute once)
+    f_supp, f_w = freq_bin_support_and_probs(cfg)
+    a_supp, a_w = amp_bin_support_and_probs(cfg)
+    p_supp, p_w = phase_bin_support_and_probs(cfg)
+
+    # fixed bank of discrete indices (length Kmax)
+    fx_i = Vector{Int}(undef, cfg.Kmax)
+    fy_i = Vector{Int}(undef, cfg.Kmax)
+    A_i  = Vector{Int}(undef, cfg.Kmax)
+    ϕ_i  = Vector{Int}(undef, cfg.Kmax)
+
+    for m in 1:cfg.Kmax
+        fx_idx = @trace(categorical(f_w), (:mode, m) => :fx_idx)
+        fy_idx = @trace(categorical(f_w), (:mode, m) => :fy_idx)
+        A_idx  = @trace(categorical(a_w), (:mode, m) => :A_idx)
+        ϕ_idx  = @trace(categorical(p_w), (:mode, m) => :ϕ_idx)
+
+        fx_i[m] = f_supp[fx_idx]
+        fy_i[m] = f_supp[fy_idx]
+        A_i[m]  = a_supp[A_idx]
+        ϕ_i[m]  = p_supp[ϕ_idx]
+    end
+
+    # continuous params for the full bank
+    fx = f_from_i.(fx_i, Ref(cfg))
+    fy = f_from_i.(fy_i, Ref(cfg))
+    A  = A_from_i.(A_i,  Ref(cfg))
+    ϕ  = ϕ_from_i.(ϕ_i,  Ref(cfg))
+
+    # stable cache key uses only the active prefix (1:K)
+    key = (K, fx_i[1:K], fy_i[1:K], A_i[1:K], ϕ_i[1:K])
+
+    return (key=key, K=K, fx=fx, fy=fy, A=A, ϕ=ϕ, fx_i=fx_i, fy_i=fy_i, A_i=A_i, ϕ_i=ϕ_i)
+end
+
+"""
+    make_fourier_scalar_field(bank; normalize=true)
+
+Returns:
+- field(x::Real, y::Real)::Float64
+
+Definition:
+  field(x,y) = Σ_{m=1..K} A[m] * cos(fx[m]*x + fy[m]*y + ϕ[m])
+
+If `scaleQ=true`, divides by max(1,K) so magnitude doesn't explode with K.
+"""
+function make_fourier_scalar_field(bank; scaleQ::Bool=true)
+    K  = bank.K
+    fx = bank.fx
+    fy = bank.fy
+    A  = bank.A
+    ϕ  = bank.ϕ
+    invK = scaleQ ? (1.0 / max(1, K)) : 1.0
+
+    field = function (x::Real, y::Real)
+        acc = 0.0
+        @inbounds for m in 1:K
+            acc += A[m] * cos(fx[m]*x + fy[m]*y + ϕ[m])
         end
-        (obj, q_obj)
-    end |> Dict
-    q_norm = sum(values(q_objs))
-    for obj in keys(q_objs); q_objs[obj] /= q_norm; end
+        return invK * acc
+    end
 
-    name_to_obj_comp_list = map(enumerate(powerset(base_obj_names, 1))) do (i, p_name)
-        ("p"*string(i), p_name)
-    end |> Dict
-    # name_to_obj_comp_list = Dict([(Symbol("p"*i), obj) for (i, obj) in enumerate(keys(q_objs))])
-    proposal_names = collect(keys(name_to_obj_comp_list))
-    name_to_q_proposal = Dict([(name, q_objs[name_to_obj_comp_list[name]]) for name in proposal_names])
-
-    obc_names = collect(Set(map(x->x[1], infer_kworld.glob_landscape.obstacles)))
-    name_to_proposed_mdp = map(enumerate(name_to_obj_comp_list)) do (i, np)
-        add_agent_to_world(infer_kworld, Dict(:name  => string(np[1]),
-                                              :start => copy(inf_agent_start),
-                                              :flist => vcat(np[2], obc_names),
-                                              :elist => copy(infer_kworld.menv.μ_order),
-                                              :w => 0., :v => 0.))
-        (np[1], infer_kworld.inhabitants[string(np[1])])
-    end |> Dict
-    return proposal_names, q_objs, name_to_obj_comp_list, name_to_q_proposal, name_to_proposed_mdp
+    return field
 end
 
-function precompute_π_proposals(name_to_proposed_mdp; solver_type=:dql, solver_params=[:softq, 10000])
-    name_to_𝒮_proposal = Dict()
-    name_to_π_proposal = Dict()
-    for (name, mdp) in name_to_proposed_mdp
-        println("\nNow computing policy for proposal: ", name)
-        name_to_𝒮_proposal[name], name_to_π_proposal[name] = quick_policy_compute_for_pomdp(mdp; solver_type=solver_type, solver_params=solver_params)
-    end
-    return name_to_𝒮_proposal, name_to_π_proposal
+"""
+    make_pomdp_objective_from_field(field; done_mode=:never, done_threshold=Inf)
+
+Converts a scalar field into MuKumari's objective signature:
+  obj(s)::Any = Any[reward::Real, done::Bool]
+
+Note that it defaults to just saying `false`, as there is no clear `done` in the open-ended case.
+"""
+function make_pomdp_objective_from_field(field::Function)
+    return (s) -> Any[field(s.x[1,1], s.x[1,2]), false]
 end
 
 ######################################################
@@ -184,205 +322,204 @@ end
 ######################################################
 
 @with_kw struct ScoreΠDist
-    prop_names::Vector
-    q_objs::Dict
-    n_compobj_list::Dict
-    n_qprop_list::Dict
-    n_propmdp_list::Dict
-    n_𝒮_proposals::Dict
-    n_π_proposals::Dict
-    solver_type::Symbol = :dql
-    solver_params::Vector = [:softq, 10000]
-    mdp_params::Vector = []
+    ## dynamic/open-ended objective ids (Fourier keys)
+    prop_names::Vector = []
+    # q_objs::Dict
+    # n_compobj_list::Dict
+    ## prior weights per proposal (key => weight)
+    n_qprop_list::Dict{Any,Float64} = Dict{Any,Float64}()
+    ## mdp cache (key => mdp)
+    n_propmdp_list::Dict{Any,Any} = Dict{Any,Any}()
+    ## solver/policy caches (key => solver, policy)
+    n_𝒮_proposals::Dict{Any,Any} = Dict{Any,Any}()
+    n_π_proposals::Dict{Any,Any} = Dict{Any,Any}()
+    # solver_type::Symbol = :dql
+    # solver_params::Vector = [:softq, 10000]
+    ## carries action mappings used by inference_model
+    mdp_params::Vector = [] # [π_alist, π_a_1hot, π_a_1hotall] (by default)
+
+    ### Open-Ended System Specific
+    ## Fourier sampling config
+    fourier_cfg::FourierDiscreteCfg = FourierDiscreteCfg()
 end
 
 # define getter functions
 get_proposal_names(π_dist::ScoreΠDist) = π_dist.prop_names
-get_proposal_component_priors(π_dist::ScoreΠDist) = π_dist.q_objs
-get_proposal_component_objectives(π_dist::ScoreΠDist, proposal) = π_dist.n_compobj_list[proposal]
+# get_proposal_component_priors(π_dist::ScoreΠDist) = π_dist.q_objs
+# get_proposal_component_objectives(π_dist::ScoreΠDist, proposal) = π_dist.n_compobj_list[proposal]
 get_proposal_prior(π_dist::ScoreΠDist, proposal) = π_dist.n_qprop_list[proposal]
 get_idxable_proposal_prior_list(π_dist::ScoreΠDist) = [get_proposal_prior(π_dist, p) for p in get_proposal_names(π_dist)]
-get_proposal_pomdp(π_dist::ScoreΠDist, proposal) = π_dist.n_propmdp_list[proposal]
-
-get_𝒮_proposal(π_dist::ScoreΠDist, proposal) = get!(π_dist.n_𝒮_proposals, proposal) do 
-    solver_from_type(get_proposal_pomdp(π_dist, proposal), π_dist.solver_type; π_dist.solver_params)
-end
-
-get_π_proposal(π_dist::ScoreΠDist, proposal) = get!(π_dist.n_π_proposals, proposal) do 
-    solve(get_𝒮_proposal(π_dist, proposal), get_proposal_pomdp(π_dist, proposal))
-end
-
-store_π_iql(π_dist::ScoreΠDist, π_iql) = push!(π_dist.n_π_proposals, :iql=>π_iql)
-get_π_iql(π_dist::ScoreΠDist) = get(π_dist.n_π_proposals, :iql, nothing)
 
 π_alist(π_dist::ScoreΠDist) = π_dist.mdp_params[1]
 π_a_1hot(π_dist::ScoreΠDist) = π_dist.mdp_params[2]
 π_a_1hotall(π_dist::ScoreΠDist) = π_dist.mdp_params[3]
 
-##############################
-# Define Constructor Functions
-##############################
-
-function lazy_precompute_π_dist(infer_kworld; solver_type=:dql, solver_params=[:softq, 10000], π_iql::Any=nothing, mdp_params=[])
-    prop_names, q_objs, n_compobj_list, n_qprop_list, n_propmdp_list = construct_q_proposals(infer_kworld)
-    n_𝒮_proposals, n_π_proposals = [Dict{Any, Any}() for i in 1:2]
-    π_dist = ScoreΠDist(prop_names, q_objs,
-                        n_compobj_list,
-                        n_qprop_list,
-                        n_propmdp_list,
-                        n_𝒮_proposals,
-                        n_π_proposals,
-                        solver_type,
-                        solver_params,
-                        mdp_params)
-
-    if !isnothing(π_iql); store_π_iql(π_dist, π_iql);
-    else; @warn "Need to separately store π_iql inside π_dist! Otherwise risks evaluations erroring out."; end
-
-    return π_dist
+# lazy create mdp if missing
+ensure_mdp!(π_dist::ScoreΠDist, key) = get!(π_dist.n_propmdp_list, key) do
+    @error "ya fucked up, where's the mdp at"
 end
 
-function precompute_π_dist(infer_kworld; solver_type=:dql, solver_params=[:softq, 10000], π_iql::Any=nothing, mdp_params=[])
-    prop_names, q_objs, n_compobj_list, n_qprop_list, n_propmdp_list = construct_q_proposals(infer_kworld)
-    n_𝒮_proposals, n_π_proposals = precompute_π_proposals(n_propmdp_list; solver_type=solver_type, solver_params=solver_params)
-
-    π_dist = ScoreΠDist(prop_names, q_objs,
-                        n_compobj_list,
-                        n_qprop_list,
-                        n_propmdp_list,
-                        n_𝒮_proposals,
-                        n_π_proposals,
-                        solver_type,
-                        solver_params,
-                        mdp_params)
-    if !isnothing(π_iql); store_π_iql(π_dist, π_iql);
-    else; @warn "Need to separately store π_iql inside π_dist! Otherwise risks evaluations erroring out."; end
-
-    return π_dist
+# lazy solver
+get_𝒮_proposal(π_dist::ScoreΠDist, key) = get!(π_dist.n_𝒮_proposals, key) do
+    mdp = ensure_mdp!(π_dist, key)
+    # specify Deep Q-learning approach; choose Soft-Q learning, for 2000 iterations (empirically selected)
+    solver_from_type(mdp, :dql; solver_params=[:softq, 200, 2, 512])
 end
 
-##########################################
-# Define distribution evaluation functions
-##########################################
+# lazy policy
+get_π_proposal(π_dist::ScoreΠDist, key) = get!(π_dist.n_π_proposals, key) do
+    𝒮 = get_𝒮_proposal(π_dist, key)
+    mdp = ensure_mdp!(π_dist, key)
+    solve(𝒮, mdp)
+end
+
+store_π_iql(π_dist::ScoreΠDist, π_iql) = push!(π_dist.n_π_proposals, :iql=>π_iql)
+get_π_iql(π_dist::ScoreΠDist) = get(π_dist.n_π_proposals, :iql, nothing)
 
 """
-    prior_sh_entropy_obj(prop_name, component_objectives_dict, q_proposal_dict)
-
-Compute the Shannon Entropy over the prior distribution for the given proposal.
-
-This comes out to be: H(q(z|o))
-    NOTE: -H(q(z|o)): sum of the negative log likelihoods of each of the objectives in the proposed objective set, using the proposal distribution
-    Compute as: ∑_{z_i∈z}q(z_i|o)*log(q(z_i|o))
-
-Used as a regularizer to the evaluation function, so that less likely proposals receive less emphasis.
+Register a newly seen key into the proposal set, if absent.
+Optionally can set a default prior mass here;
+TODO-lowprio: simplest is uniform mass then renormalize.
 """
-function prior_sh_entropy_obj(π_dist::ScoreΠDist, prop_name)
-    q_proposal_dict = get_proposal_component_priors(π_dist)
-    mapreduce(n->q_proposal_dict[[n]] * log(q_proposal_dict[[n]]), +, get_proposal_component_objectives(π_dist, prop_name), init=0)
-end
-
-function expected_data_recons_err(π_dist::ScoreΠDist, prop_name, data::ExperienceBuffer; eval_tsteps=100, init_eval_tstep=1)
-    mdp = get_proposal_pomdp(π_dist, prop_name)
-    q_zo = get_proposal_prior(π_dist, prop_name)
-    π_prop = get_π_proposal(π_dist, prop_name)
-    all_a_onehot = π_a_1hotall(π_dist)
-
-    expectation_sum = 0
-    exp_sum_tracker = Matrix{Any}(undef, eval_tsteps, 3)
-    for i in init_eval_tstep:(init_eval_tstep+eval_tsteps-1)
-        if i > data.elements
-            break
-        end
-        recon_val = Crux.value(π_prop, data.data[:s][:,i], all_a_onehot)
-        recon_prob = softmax(recon_val .- maximum(recon_val), dims=2) * data.data[:a][:,i]
-        # sum log prob (clip value to prevent underflow to -∞)
-        log_likelihood_recon_prob = log(max(recon_prob[1], 1e-30))
-        expectation_sum += log_likelihood_recon_prob
-        exp_sum_tracker[i-init_eval_tstep+1, :] = [data.data[:s][:,i], log_likelihood_recon_prob, q_zo * expectation_sum]
+function register_key_if_new!(π_dist::ScoreΠDist, key; prior_mass::Float64=1.0)
+    if !(key in π_dist.prop_names)
+        push!(π_dist.prop_names, key)
+        π_dist.n_qprop_list[key] = prior_mass
     end
-    return expectation_sum, exp_sum_tracker
+    return key
 end
 
-function grid_points(n, dims=(0.,10.))
-    dim_span = dims[2] - dims[1]
-    dim_shift = dim_span / 20 # 5% shift
-    nx = ceil(Int, sqrt(n))
-    ny = ceil(Int, n/nx)
-    xs = range(dims[1]+dim_shift, dims[2]-dim_shift; length=nx)
-    ys = range(dims[1]+dim_shift, dims[2]-dim_shift; length=ny)
-    collect(Iterators.take(([x y] for y in ys for x in xs), n))
+# Decide target training budget based on posterior mass
+@inline function training_budget(prob::Float64)
+    prob ≥ 0.30 && return 1500
+    prob ≥ 0.10 && return 800
+    prob ≥ 0.03 && return 300
+    return 0
 end
 
-function expected_recons_err_against_iql(π_dist::ScoreΠDist, prop_name; π_iql::Any=nothing, eval_num=100)
-    # Assert that IQLearn Policy has been assigned, in order to do evaluation!
-    @assert !(isnothing(π_iql) && isnothing(get_π_iql(π_dist))) "Need to specify π_iql at call-time or store in π_dist ahead of time!"
-    if isnothing(π_iql); π_iql = get_π_iql(π_dist); end
+"""
+    surrogate_dataset_from_iql_grid(π_dist, π_iql, mdp;
+                                   eval_num=200,
+                                   dims=nothing)
 
-    mdp = get_proposal_pomdp(π_dist, prop_name)
-    q_zo = get_proposal_prior(π_dist, prop_name)
-    π_prop = get_π_proposal(π_dist, prop_name)
-    all_a_onehot = π_a_1hotall(π_dist)
+Evaluate π_iql on a grid of points across the environment, returning:
+- state_data::Matrix{Float64} of size (2, N)  [x;y] per column
+- observations::Vector{Int} of length N       action index aidx per point
+- eval_locations::Vector{Any} (optional convenience) the original [x y] points
 
-    eval_locations = grid_points(eval_num, mdp.dimensions)
-    mdp_states = map(x->blindstart_KAgentState(mdp, x), eval_locations)
-    mdp_states_as_obs = map(s->MuKumari.shape_state_as_obs(mdp, s), mdp_states)
-    iql_optimal_actions = map(s->action(π_iql, s)[1], mdp_states_as_obs)
+Note: `mdp` should be the `mdp` used for training π_iql! Not another one.
+"""
+function surrogate_dataset_from_iql_grid(π_dist::ScoreΠDist,
+                                        π_iql,
+                                        mdp::KAgentPOMDP;
+                                        eval_num::Int=200,
+                                        dims=nothing)
 
-    expectation_sum = 0
-    exp_sum_tracker = Matrix{Any}(undef, eval_num, 3)
-    for i in 1:eval_num
-        recon_val = Crux.value(π_prop, mdp_states_as_obs[i], all_a_onehot)
-        recon_prob = softmax(recon_val .- maximum(recon_val), dims=2) * π_a_1hot(π_dist)(iql_optimal_actions[i])
-        # sum log prob (clip value to prevent underflow to -∞)
-        log_likelihood_recon_prob = log(max(recon_prob[1], 1e-30))
-        expectation_sum += log_likelihood_recon_prob
-        exp_sum_tracker[i, :] = [eval_locations[i], log_likelihood_recon_prob, q_zo * expectation_sum]
+    # ----- grid sampling (same idea as grid_points in geninf_on_single_trace.jl) -----
+    # grid_points(n, dims=(0.,10.)) returns a Vector of 1×2 matrices [x y] :contentReference[oaicite:3]{index=3}
+    if isnothing(dims)
+        dims = mdp.dimensions
     end
-    return expectation_sum, exp_sum_tracker
-end
+    dim_span  = dims[2] - dims[1]
+    dim_shift = dim_span / 20
+    nx = ceil(Int, sqrt(eval_num))
+    ny = ceil(Int, eval_num / nx)
+    xs = range(dims[1] + dim_shift, dims[2] - dim_shift; length=nx)
+    ys = range(dims[1] + dim_shift, dims[2] - dim_shift; length=ny)
+    eval_locations = collect(Iterators.take(([x y] for y in ys for x in xs), eval_num))
 
-"""
-    evaluate_proposed_objective(pomdp::KAgentPOMDP, π_proposed, π_infer, data::ExperienceBuffer, q_objectives)
+    N = length(eval_locations)
 
-Evaluates the provided policy (π_proposed) under three different evaluation schemes.
-
-Based off Equation (6) from the VAE paper Structural Relational Inference Actor-Critic for Multi-Agent Reinforcement Learning (Zhang et. al.)
-Below is a discussion of the three evaluation schemes.
-
-NOTE: q(z|o) refers to likelihood of underlying feature (z) w.r.t. observations (o)
- * Here, z is the proposed objective set, and o is the timeseries of observed actions
- * We can define q(z|o) approximately as the proposal distribution
-
-Scheme 1: E_q[log(p(o|z))]
- * approximately equivalent to the Open-ended SIPS approach of P(g|π,o)/Q(g) (error of reconstruction to true obs weighted by likelihood of reconstruction)
- * Approximate E_q[p(o|z)] as (∑π(a_true) ∀ a ∈ [set of observations]) * q(z|o)
- * This is an adaptation of the Open-ended SIPS approach
-
-Scheme 2: E_q[log(p(o|z))] + H(q(z|o))
- * The combination of Open-ended SIPS with the L_VAE from SRI-AC
-
-Scheme 3: E_q[log(p_iq(o|z))] + H(q(z|o)): Using IQLearn's output as a softer, smoothened, broader point of comparison, instead of directly against data
-"""
-function evaluate_proposed_objective(π_dist::ScoreΠDist, prop_name, data::ExperienceBuffer; eval_steps=100, π_iql::Any=nothing)
-    # standard mechanism to evaluate
-
-    eval_1 = expected_data_recons_err(π_dist, prop_name, data; eval_tsteps=eval_steps, init_eval_tstep=1)
-    eval_2 = (eval_1[1] + prior_sh_entropy_obj(π_dist, prop_name), eval_1[2])
-    eval_2[2][:,2:3] .+= prior_sh_entropy_obj(π_dist, prop_name)
-    eval_3 = expected_recons_err_against_iql(π_dist, prop_name; eval_num=eval_steps, π_iql=π_iql)
-
-    println("Scores under different eval schemes:: Proposal named: ", prop_name)
-    println("\tScheme 1: ", eval_1[1], " | Scheme 2: ", eval_2, " | Scheme 3: ", eval_3[1])
-
-    # let s = rand(initialstate(pomdp)), o = rand(initialobs(pomdp, s)), a = Flux.onehot(:nw, actions(pomdp))
-    #     action(π_infer, o) # fully unnecessary to construct this, just doing this for example's sake
-    #     Crux.value(π_proposed, o, a) # use the observation to produce this
-    #     Crux.value(π_proposed, MuKumari.shape_state_as_obs(pomdp, s), a) # alternatively, use the internal func`shape_state_as_obs` function on a state directly
-    #     j = 1
-    #     Crux.value(π_infer, data.data[:s][:,j], data.data[:a][:,j]) # OR evaluate on a timestep drawn from of the ExperienceBuffer (at time = j)
+    # ----- build state_data matrix (2 × N) -----
+    state_data = Matrix{Float64}(undef, Crux.dim(state_space(mdp))[1], N)
+    # @inbounds for i in 1:N
+    #     # eval_locations[i] is 1×2; store as x,y rows
+    #     state_data[1, i] = Float64(eval_locations[i][1])
+    #     state_data[2, i] = Float64(eval_locations[i][2])
     # end
 
-    return eval_1, eval_2, eval_3
+    # ----- map action symbol -> action index (aidx) -----
+    alist = π_alist(π_dist)
+    a_to_idx = Dict{Any, Int}(a => j for (j, a) in enumerate(alist))
+
+    observations = Vector{Int}(undef, N)
+
+    # ----- evaluate π_iql on each grid state (pattern from expected_recons_err_against_iql) -----
+    # expected_recons_err_against_iql does:
+    #   s_obs = MuKumari.shape_state_as_obs(mdp, blindstart_KAgentState(mdp, x))
+    #   a*    = action(π_iql, s_obs)[1] :contentReference[oaicite:4]{index=4}
+    @inbounds for i in 1:N
+        s = blindstart_KAgentState(mdp, eval_locations[i])
+        obs = MuKumari.shape_state_as_obs(mdp, s)
+        state_data[:, i] = copy(obs)
+        asymb = action(π_iql, obs)[1]
+
+        idx = get(a_to_idx, asymb, 0)
+        idx == 0 && error("π_iql returned action $(asymb) not found in π_alist(π_dist). Check action sets match.")
+        observations[i] = idx
+    end
+
+    return state_data, observations, eval_locations
+end
+
+#############################################################
+# Define KAgentPOMDP around open-ended scalar field objective
+#############################################################
+
+"""
+    build_kagent_pomdp(agent_params::Dict, obj::Function; name="fourier_obj")
+
+Required keys in agent_params:
+- :start::Matrix
+- :dimensions::Tuple   # (d1, d2), same semantics as MuKumari
+- :menv::MuEnv
+
+Optional keys (with defaults aligned to init_standard_KAgentPOMDP):
+- :digits::Int
+- :agent_width::Float64
+- :agent_speed::Float64
+- :ag_mvt_noise::Float64
+- :obs_noise::Float64
+- :mdp_discount::Float64
+- :obcs::Vector   # optional obstacles geometry (default empty)
+- :goals::Vector  # optional goals geometry (default empty)
+"""
+function build_kagent_pomdp(agent_params::Dict, obj::Function; name::String="fourier_obj")
+    @assert haskey(agent_params, :start)
+    @assert haskey(agent_params, :dimensions)
+    @assert haskey(agent_params, :menv)
+    @assert haskey(agent_params, :obcs)
+
+    start      = agent_params[:start]
+    d          = agent_params[:dimensions]
+    menv       = agent_params[:menv]
+    obcs       = agent_params[:obcs]
+
+    digits     = get(agent_params, :digits, 3)
+    width      = get(agent_params, :agent_width, 0.1)
+    speed      = get(agent_params, :agent_speed, 1.0)
+    ag_noise   = get(agent_params, :ag_mvt_noise, 0.05)
+    obs_noise  = get(agent_params, :obs_noise, 0.05)
+    γ          = get(agent_params, :mdp_discount, 0.95)
+
+    goals      = get(agent_params, :goals, Any[])
+
+    # Minimal agent landscape placeholder (not used to define obj)
+    objl = AgentObjectiveLandscape(objectives=Any[], f_types=Any[])
+
+    # Mirror init_standard_KAgentPOMDP world construction
+    boxworld = GI.Polygon([[(d[1], d[1]), (d[1], d[2]), (d[2], d[2]), (d[2], d[1]), (d[1], d[1])]])
+    # Note: if obcs are empty, world is just the exterior ring.
+    world = isempty(obcs) ? boxworld : GI.Polygon([GI.getexterior(boxworld), map(o -> GI.getexterior(o), obcs)...])
+
+    return KAgentPOMDP(name=name, start=start,
+                      dimensions=d, boxworld=boxworld,
+                      objl=objl, obcs=obcs, goals=goals,
+                      obj=obj,
+                      world=world,
+                      width=width, s=speed, w=ag_noise,
+                      menv=menv, v=obs_noise, γ=γ,
+                      digits=digits)
 end
 
 ##############################################
@@ -393,7 +530,7 @@ struct ActionDirac <: Gen.Distribution{AbstractVector}
 end
 
 Gen.random(::ActionDirac, x::AbstractVector) = x
-Gen.logpdf(::ActionDirac, v::AbstractVector, x::AbstractVector) = v == x ? 0.0 : -Inf
+Gen.logpdf(::ActionDirac, v::AbstractVector, x::AbstractVector) = (argmax(v) == argmax(x)) ? 0.0 : -Inf
 Gen.logpdf_grad(::ActionDirac, v, x) = (nothing,)
 Gen.has_output_grad(::ActionDirac) = false
 Gen.is_discrete(::ActionDirac) = true
@@ -401,9 +538,15 @@ Gen.is_discrete(::ActionDirac) = true
 const actiondirac = ActionDirac()
 (::ActionDirac)(x::AbstractVector) = Gen.random(ActionDirac(), x)
 
+ensure_mdp!(π_dist::ScoreΠDist, key, ff, agent_params::Dict) = get!(π_dist.n_propmdp_list, key) do
+    field = make_fourier_scalar_field(ff; scaleQ=true)
+    obj   = make_pomdp_objective_from_field(field)
+
+    build_kagent_pomdp(agent_params, obj; name="fourier_" * string(hash(key)))
+end
 
 """
-    proposal_boltzmann(π_dist::ScoreΠDist, prop_name, loc)
+    proposal_boltzmann(π_dist::ScoreΠDist, prop_name, loc::KAgentState)
 
 
 Computes Boltzmann distribution for π_{prop_name}(s).
@@ -423,14 +566,18 @@ Returns: `boltzmann`
   * Columns correspond to actions.
   * Values are cast to `Float64` (from `Float32`, e.g. when computed on GPU) for compatibility with Gen’s tracing and scoring machinery.
 """
-function proposal_boltzmann(π_dist::ScoreΠDist, prop_name, loc)
-    mdp = get_proposal_pomdp(π_dist, prop_name)
+function proposal_boltzmann(π_dist::ScoreΠDist, prop_name, loc; temperature::Float64=1.0)
+    mdp = ensure_mdp!(π_dist, prop_name)
     π_prop = get_π_proposal(π_dist, prop_name)
     all_a_onehot = π_a_1hotall(π_dist)
 
     # assume state location already in obs vec form, otherwise need to use MuKumari.shape_state_as_obs(loc)
-    unnormalized_pdfs = Crux.value(π_prop, MuKumari.shape_state_as_obs(mdp, loc), all_a_onehot)
-    boltzmann = softmax(unnormalized_pdfs .- maximum(unnormalized_pdfs), dims=2)
+    q = Crux.value(π_prop, MuKumari.shape_state_as_obs(mdp, loc), all_a_onehot)
+    # Stability + temperature
+    T = max(temperature, 1e-6)
+    logits = (q .- maximum(q, dims=2)) ./ T
+
+    boltzmann = softmax(logits, dims=2)
 
     # cast boltzmann distribution into Float64 form, from as the GPU operates in Float32
     return Float64.(boltzmann)
@@ -438,160 +585,683 @@ end
 
 Base.copy(s::KAgentState) = KAgentState(copy(s.x), copy(s.z), copy(s.hist))
 
-@gen function inference_model(T, π_dist::ScoreΠDist, s0)
-    idx_priors = get_idxable_proposal_prior_list(π_dist)
-    idx = {:idx} ~ categorical(idx_priors)
-    q = get_proposal_names(π_dist)[idx]
-    mdp = get_proposal_pomdp(π_dist, q)
-    s = copy(s0)
-    a_all = []
-    for t=1:T
-        boltzmann = max.(vec(proposal_boltzmann(π_dist, q, s)), 0.0) # vectorize output and guardrail against negative probabilities
-        boltzmann ./= sum(boltzmann)
-        aidx = {t => :aidx} ~ categorical(boltzmann)
-        asymb = π_alist(π_dist)[aidx]
-        a = π_a_1hot(π_dist)(asymb)
-        println(a)
-        {t => :a} ~ actiondirac(a)
-        push!(a_all, a)
-        s = POMDPs.@gen(:sp)(mdp, s, asymb)
-    end
-    return a_all
+"""
+Decode your Fourier key of the form (K, fx_i, fy_i, A_i, ϕ_i) into continuous params.
+Assumes fx_i etc are integer vectors of length K (or length Kmax, if fixed-bank).
+"""
+function decode_fourier_key(key, cfg::FourierDiscreteCfg)
+    K, fx_i, fy_i, A_i, ϕ_i = key
+    # use only active prefix if vectors are longer
+    fx = f_from_i.(fx_i[1:K], Ref(cfg))
+    fy = f_from_i.(fy_i[1:K], Ref(cfg))
+    A  = A_from_i.(A_i[1:K],  Ref(cfg))
+    ϕ  = ϕ_from_i.(ϕ_i[1:K],  Ref(cfg))
+    return (K=K, fx=fx, fy=fy, A=A, ϕ=ϕ, fx_i=fx_i[1:K], fy_i=fy_i[1:K], A_i=A_i[1:K], ϕ_i=ϕ_i[1:K])
 end
 
-function particle_filter(observations, π_dist, start_state, n_particles, ess_thresh=0.5)
-    # Initialize particle filter with first observation
-    n_obs = size(observations)[2]
-    obs_choices = [choicemap((t => :a, observations[:,t])) for t=1:n_obs]
-    state = pf_initialize(inference_model, (1, π_dist, start_loc), obs_choices[1], n_particles)
-    # Iterate across timesteps
-    for t=2:n_obs
-        # Resample and rejuvenate if the effective sample size is too low
-        if effective_sample_size(state) < ess_thresh * n_particles
-            # Perform residual resampling, pruning low-weight particles
-            pf_resample!(state, :residual)
-            # Perform a rejuvenation move on past choices
-            rejuv_sel = select(:idx, t-1=>:aidx, t=>:a)
-            pf_rejuvenate!(state, mh, (rejuv_sel,))
-        end
-        # Update filter state with new observation at timestep t
-        pf_update!(state, (t, π_dist, start_loc), (UnknownChange(),), obs_choices[t])
-    end
-    return state
-end
-
-
 """
-    top_objectives(pf_state; key_fn=default_key_fn, topk=10)
+    top_objectives(pf_state, π_dist; topk=10)
 
-Return the top objectives (keys) by posterior probability mass.
-
-Arguments
-- pf_state: particle filter state (GenParticleFilters PF state or a struct with `particles`/`log_weights`)
-- key_fn(trace) -> key: extracts an "objective identity" from a trace
-- topk: number of objectives to return
-
-Returns
-- Vector of NamedTuples: [(key=..., prob=..., count=...), ...] sorted by prob desc
+Aggregates posterior mass by objective key (= trace return value).
+Returns top-k with:
+- key
+- prob mass
+- count
+- decoded Fourier params
 """
-function top_objectives(pf_state; key_fn = tr -> get_choice(tr, :idx), topk::Int = 10)
+function top_objectives(pf_state, π_dist::ScoreΠDist; topk::Int = 10)
     traces = get_traces(pf_state)
     logw   = get_log_weights(pf_state)
 
-    # ---- robust weight normalization ----
-    finite_mask = isfinite.(logw)
-    if !any(finite_mask)
-        # All particles have -Inf log weight -> no meaningful posterior
-        return NamedTuple[]
+    # robust normalization (handles large negative logw); if all -Inf => fallback to counts
+    finite = isfinite.(logw)
+    if !any(finite)
+        # no numeric weights available; return empirical counts only
+        counts = Dict{Any,Int}()
+        for tr in traces
+            key = get_retval(tr)
+            counts[key] = get(counts, key, 0) + 1
+        end
+        keys_sorted = sort(collect(keys(counts)), by=k->counts[k], rev=true)
+        Kout = min(topk, length(keys_sorted))
+        return [(key=keys_sorted[j],
+                 prob=NaN,  # explicitly “unknown”
+                 count=counts[keys_sorted[j]],
+                 params=decode_fourier_key(keys_sorted[j], π_dist.fourier_cfg))
+                for j in 1:Kout]
     end
 
-    lw = logw[finite_mask]
-    tr = traces[finite_mask]
+    lw = logw[finite]
+    tr = traces[finite]
 
     m = maximum(lw)
     w = exp.(lw .- m)
     Z = sum(w)
-    if !(Z > 0.0) || !isfinite(Z)
-        return NamedTuple[]
-    end
     p = w ./ Z
 
-    # aggregate posterior mass
     mass   = Dict{Any,Float64}()
     counts = Dict{Any,Int}()
 
-    @inbounds for i in eachindex(traces)
-        k = key_fn(traces[i])
-        mass[k]   = get(mass, k, 0.0) + p[i]
-        counts[k] = get(counts, k, 0) + 1
+    @inbounds for i in eachindex(tr)
+        key = get_retval(tr[i])
+        mass[key]   = get(mass, key, 0.0) + p[i]
+        counts[key] = get(counts, key, 0) + 1
     end
 
-    # sort by posterior mass
-    keys_sorted = sort(collect(keys(mass)), by = k -> mass[k], rev = true)
+    keys_sorted = sort(collect(keys(mass)), by=k->mass[k], rev=true)
+    Kout = min(topk, length(keys_sorted))
 
-    K = min(topk, length(keys_sorted))
-    return [
-        (key = k,
-         prob = mass[k],
-         count = counts[k])
-        for k in keys_sorted[1:K]
-    ]
+    return [(key=keys_sorted[j],
+             prob=mass[keys_sorted[j]],
+             count=counts[keys_sorted[j]],
+             params=decode_fourier_key(keys_sorted[j], π_dist.fourier_cfg))
+            for j in 1:Kout]
 end
+
+"""
+    training_budget(prob; schedule=(200,600,1500), τ=(0.03,0.10,0.30))
+
+Map posterior mass -> target training N.
+
+- If prob ≥ τ3 => schedule[3]
+- else if prob ≥ τ2 => schedule[2]
+- else if prob ≥ τ1 => schedule[1]
+- else => 0  (do not train yet)
+"""
+function training_budget(prob::Real; schedule::NTuple{3,Int}=(200, 600, 1500),
+                         τ::NTuple{3,Float64}=(0.03, 0.10, 0.30))
+    p = float(prob)
+    if !isfinite(p) || p ≤ 0
+        return 0
+    elseif p ≥ τ[3]
+        return schedule[3]
+    elseif p ≥ τ[2]
+        return schedule[2]
+    elseif p ≥ τ[1]
+        return schedule[1]
+    else
+        return 0
+    end
+end
+
+"""
+    hamming_fourier_key(k1, k2) -> Int
+
+Hamming distance on Fourier *discrete* key representation.
+
+Key format assumed:
+    (K::Int, fx_i::Vector{Int}, fy_i::Vector{Int}, A_i::Vector{Int}, ϕ_i::Vector{Int})
+
+Only compare the active prefixes (1:K), and add abs(K1-K2).
+"""
+function hamming_fourier_key(k1, k2)
+    K1, fx1, fy1, A1, ϕ1 = k1
+    K2, fx2, fy2, A2, ϕ2 = k2
+    d = abs(K1 - K2)
+
+    K = min(K1, K2)
+    @inbounds for m in 1:K
+        d += (fx1[m] != fx2[m])
+        d += (fy1[m] != fy2[m])
+        d += (A1[m]  != A2[m])
+        d += (ϕ1[m]  != ϕ2[m])
+    end
+
+    # treat unmatched tail entries as mismatches
+    if K1 != K2
+        Kbig = max(K1, K2)
+        d += 4 * (Kbig - K)  # each extra mode has 4 discrete indices
+    end
+    return d
+end
+
+"""
+    nearest_trained_key(π_dist, key; min_trained=1)
+
+Returns the closest key among those already in π_dist.n_π_proposals and
+whose training steps record indicates ≥ min_trained.
+Returns `nothing` if none exist.
+"""
+function nearest_trained_key(π_dist::ScoreΠDist, key; min_trained::Int=1)
+    best = nothing
+    best_d = typemax(Int)
+
+    # fall back if training bookkeeping not present yet
+    steps = get!(π_dist.n_𝒮_proposals, :_trained_steps) do
+        Dict{Any,Int}()
+    end
+
+    for k in keys(π_dist.n_π_proposals)
+        # skip non-keys (e.g. :iql)
+        k isa Tuple || continue
+        get(steps, k, 0) ≥ min_trained || continue
+
+        d = hamming_fourier_key(key, k)
+        if d < best_d
+            best = k
+            best_d = d
+        end
+    end
+    return best
+end
+
+"""
+    maybe_refine_policies!(π_dist, pf_state, agent_params;
+                           topk=5, schedule=(200,600,1500), τ=(0.03,0.10,0.30))
+
+Look at current PF posterior, choose a target budget per key via training_budget,
+and call ensure_policy_trained_to! to escalate only those keys.
+"""
+function maybe_refine_policies!(π_dist::ScoreΠDist, pf_state, agent_params::Dict;
+                               topk::Int=5,
+                               schedule::NTuple{3,Int}=(200,600,1500),
+                               τ::NTuple{3,Float64}=(0.03,0.10,0.30))
+    tops = top_objectives(pf_state, π_dist; topk=topk)
+    for item in tops
+        # item.prob may be NaN during all -Inf weights; skip in that case
+        prob = item.prob
+        target = training_budget(prob; schedule=schedule, τ=τ)
+        target == 0 && continue
+        ensure_policy_trained_to!(π_dist, item.key, agent_params;
+                                 target_steps=target, warm_start=true)
+    end
+    return nothing
+end
+
+############################
+# Warm start utilities
+############################
+
+# Try to get a Flux/Crux model object we can copy params into/out of
+_policy_model(π) = hasproperty(π, :model) ? getproperty(π, :model) : π
+
+function _warm_start_params!(π_dest, π_src)
+    md = _policy_model(π_dest)
+    ms = _policy_model(π_src)
+
+    pd = Flux.params(md)
+    ps = Flux.params(ms)
+
+    if length(pd) != length(ps)
+        @warn "Warm start skipped (param count mismatch)" nd=length(pd) ns=length(ps)
+        return π_dest
+    end
+
+    for (d, s) in zip(pd, ps)
+        if size(d) != size(s)
+            @warn "Warm start skipped (param shape mismatch)" sized=size(d) sizes=size(s)
+            return π_dest
+        end
+    end
+
+    for (d, s) in zip(pd, ps)
+        d .= s
+    end
+    return π_dest
+end
+
+############################
+# Multi-fidelity training core
+############################
+
+"""
+    ensure_policy_trained_to!(π_dist, key, agent_params;
+                              target_steps, warm_start=true,
+                              epochs=2, batch_size=512)
+
+Ensures:
+- an MDP exists for key (must already be in n_propmdp_list; created via inference_model)
+- a SoftQ solver/policy exists
+- training has been run up to `target_steps` (in solver N units)
+
+Uses:
+- nearest_trained_key(...) and hamming_fourier_key(...) for warm start
+- stores trained steps in π_dist.n_𝒮_proposals[:_trained_steps]::Dict{Any,Int}
+
+Returns: policy object (π_dist.n_π_proposals[key])
+"""
+function ensure_policy_trained_to!(π_dist::ScoreΠDist, key, agent_params::Dict;
+                                  target_steps::Int,
+                                  warm_start::Bool=true,
+                                  epochs::Int=2,
+                                  batch_size::Int=512)
+
+    # bookkeeping dict (stored inside n_𝒮_proposals to avoid struct edits)
+    trained = get!(π_dist.n_𝒮_proposals, :_trained_steps) do
+        Dict{Any,Int}()
+    end
+    already = get(trained, key, 0)
+    if already ≥ target_steps && haskey(π_dist.n_π_proposals, key)
+        return π_dist.n_π_proposals[key]
+    end
+
+    # MDP must exist (inference_model should have created it)
+    if !haskey(π_dist.n_propmdp_list, key)
+        # If key hasn't been instantiated yet, we cannot train it here.
+        # (The PF will create it once it samples it.)
+        return get(π_dist.n_π_proposals, key, nothing)
+    end
+    mdp = ensure_mdp!(π_dist, key)
+
+    # Build a solver for the *target* budget.
+    solver = solver_from_type(mdp, :dql; solver_params=[:softq, target_steps, epochs, batch_size])
+
+    # Warm start policy network parameters from nearest trained neighbor (if requested)
+    if warm_start
+        nn = nearest_trained_key(π_dist, key; min_trained=1)
+        if nn !== nothing && haskey(π_dist.n_π_proposals, nn)
+            try
+                if hasproperty(solver, :π)
+                    _warm_start_params!(getproperty(solver, :π), π_dist.n_π_proposals[nn])
+                end
+            catch err
+                @warn "Warm start failed; training from scratch" err=err
+            end
+        end
+    end
+
+    # Train policy (solve)
+    π = solve(solver, mdp)
+
+    # Cache updated solver/policy and trained steps
+    π_dist.n_𝒮_proposals[key] = solver
+    π_dist.n_π_proposals[key] = π
+    trained[key] = target_steps
+
+    return π
+end
+
+@gen function inference_model(N::Int, π_dist::ScoreΠDist, agent_params::Dict, state_data::Matrix)
+    # sample discretized Fourier parameters (traceable)
+    fourier = @trace(gen_fourier_bank_fixed(π_dist.fourier_cfg), :fourier)
+    key = fourier.key
+    # register for downstream reporting / priors
+    register_key_if_new!(π_dist, key)
+
+    # lazy build mdp/policy (side-effecting cache)
+    mdp = ensure_mdp!(π_dist, key, fourier, agent_params)
+    _   = get_π_proposal(π_dist, key) # only use this to do lazy-loading as needed
+
+    temp = get(agent_params, :policy_temperature, 1.0)
+    for n in 1:N
+        s = blindstart_KAgentState(mdp, reshape(state_data[:,n][1:2], (1,2)))
+        boltzmann = max.(vec(proposal_boltzmann(π_dist, key, s; temperature=temp)), 0.0)
+        boltzmann ./= sum(boltzmann)
+        _ = {n => :aidx} ~ categorical(boltzmann)
+    end
+
+    return key
+end
+
+function particle_filter(observations::Vector{Int}, π_dist::ScoreΠDist, agent_params::Dict, state_data::Matrix,
+                         n_particles::Int = 50; ess_thresh::Float64 = 0.5,
+                         rejuv_modes::Int = 8, rejuv_recent_actions::Int = 3,
+                         resample_alg::Symbol = :residual,
+                         refine_every::Int = 5,
+                         refine_topk::Int = 5)
+
+    N = length(observations)
+    obs_choices = [choicemap((n => :aidx, observations[n])) for n in 1:N]
+
+    state = pf_initialize(inference_model, (1, π_dist, agent_params, state_data), obs_choices[1], n_particles)
+
+    for n in 2:N
+        if effective_sample_size(state) < ess_thresh * n_particles
+            pf_resample!(state, resample_alg)
+
+            # rejuvenation selection
+            sels = Any[:fourier => :K]
+            M = min(rejuv_modes, π_dist.fourier_cfg.Kmax)
+
+            for m in 1:M
+                push!(sels, (:fourier, :mode, m) => :fx_idx)
+                push!(sels, (:fourier, :mode, m) => :fy_idx)
+                push!(sels, (:fourier, :mode, m) => :A_idx)
+                push!(sels, (:fourier, :mode, m) => :ϕ_idx)
+            end
+
+            a_lo = max(1, n - rejuv_recent_actions)
+            for τ in a_lo:(n-1)
+                push!(sels, (τ => :aidx))
+            end
+
+            pf_rejuvenate!(state, mh, (select(sels...),))
+
+            # after a resample/rejuv event is a great time to refine top policies
+            maybe_refine_policies!(π_dist, state, agent_params; topk=refine_topk)
+        end
+
+        # Update with new observation
+        pf_update!(state,
+                   (n, π_dist, agent_params, state_data),
+                   (UnknownChange(), NoChange(), NoChange(), NoChange()),
+                   obs_choices[n])
+
+        # periodic refinement (lightweight)
+        if (n % refine_every) == 0
+            maybe_refine_policies!(π_dist, state, agent_params; topk=refine_topk)
+        end
+    end
+
+    return state
+end
+
+# @gen function inference_model(T::Int, π_dist::ScoreΠDist, agent_params::Dict)
+#     # sample discretized Fourier parameters (traceable)
+#     fourier = @trace(gen_fourier_bank_fixed(π_dist.fourier_cfg), :fourier)
+#     key = fourier.key
+#     # register for downstream reporting / priors
+#     register_key_if_new!(π_dist, key)
+
+#     # lazy build mdp/policy (side-effecting cache)
+#     mdp = ensure_mdp!(π_dist, key, fourier, agent_params)
+#     π   = get_π_proposal(π_dist, key) # only use this to do lazy-loading as needed
+
+#     s = copy(agent_params[:start_state])
+#     temp = get(agent_params, :policy_temperature, 1.0)
+#     a_all = []
+#     for t in 1:N
+#         boltzmann = max.(vec(proposal_boltzmann(π_dist, key, s; temperature=temp)), 0.0)
+#         boltzmann ./= sum(boltzmann)
+#         aidx = {t => :aidx} ~ categorical(boltzmann)
+
+#         asymb = π_alist(π_dist)[aidx]
+#         a = π_a_1hot(π_dist)(asymb)
+#         {t => :a} ~ actiondirac(a) # record action choice for debugging traces
+#         push!(a_all, a)
+#         # state transition
+#         s = POMDPs.@gen(:sp)(mdp, s, asymb)
+#     end
+
+#     return key
+# end
 
 ################
 ### Plotting ###
 ################
 
-function evaluate_all_proposed_objs(π_dist::ScoreΠDist, data::ExperienceBuffer; eval_steps=100, π_iql::Any=nothing)
-    prop_evals = Dict{Any, Any}()
-    for prop_name in get_proposal_names(π_dist)
-        prop_evals[prop_name] = evaluate_proposed_objective(π_dist, prop_name, data; eval_steps=eval_steps, π_iql=π_iql)
-    end
-    return prop_evals
+############################
+### Objective Visualization
+############################
+
+"""
+    _dims_to_bounds(dimensions) -> (lo, hi)
+
+Your code treats `dimensions` as a 2-tuple (d1, d2) and constructs the boxworld
+with corners (d1,d1) and (d2,d2). This helper just standardizes that.
+"""
+@inline function _dims_to_bounds(dimensions)
+    lo, hi = dimensions[1], dimensions[2]
+    lo <= hi || error("dimensions must satisfy dimensions[1] <= dimensions[2]; got $(dimensions)")
+    return lo, hi
 end
 
-function plot_evaluations_over_timesteps(evals::Tuple)
-    # specifically extract the third column (cumulative log likelihood)
-    eval_timeseries = map(ev->ev[2][:,3], evals)
-    time_axis = 1:size(eval_timeseries[1])[1]
+"""
+    _grid_from_mdp(mdp; gridsize=100) -> (xs, ys)
 
-    plt = plot(xlabel="# of Data Points Evaluated", ylabel="Neg. Log Likelihood", lw=2)
-
-    for (i, ts) in enumerate(eval_timeseries)
-        plot!(plt, time_axis, ts, label="Scheme $i")
-    end
-
-    plt
+Grid over (x,y) spanning mdp.dimensions.
+"""
+function _grid_from_mdp(mdp::KAgentPOMDP; gridsize::Int=100)
+    lo, hi = _dims_to_bounds(mdp.dimensions)
+    xs = range(lo, hi; length=gridsize)
+    ys = range(lo, hi; length=gridsize)
+    return xs, ys
 end
 
-function plot_evaluations_over_timesteps(evals::Dict)
-    # specifically extract the third column (cumulative log likelihood)
-    # time_axis = 1:size(eval_timeseries[1])[1]
-    time_axis = 1:size(evals[first(keys(evals))][1][2][:,3])[1]
-    scheme_names = Dict(1=>"Open-ended SIPS", 2=>"Entropy-biased SIPS", 3=>"IQLearn-guided SIPS")
+"""
+    _state_at_xy(mdp, x, y) -> KAgentState
 
-    plt = plot(xlabel="# of Data Points Evaluated", ylabel="Neg. Log Likelihood",
-               title="Effectiveness of proposed objective evaluation\nunder various SIPS schemes", lw=2)
+Constructs a state located at (x,y) using MuKumari's blindstart helper.
+This matches your usage pattern at the bottom of the file.
+"""
+@inline function _state_at_xy(mdp::KAgentPOMDP, x::Real, y::Real)
+    return blindstart_KAgentState(mdp, reshape([Float64(x), Float64(y)], (1,2)))
+end
 
-    proposals = collect(keys(evals))
-    base_colors = palette(:tab10, length(proposals)*2)
-    linestyles = (:solid, :dash, :dot)
+"""
+    objective_grid_from_field(field, xs, ys) -> Matrix
 
-    for (i, key) in pairs(proposals)
-        data = map(ev->ev[2][:,3], evals[key])
-        color = base_colors[i]
-
-        for (j, ts) in enumerate(data)
-            if j==2
-                continue
-            end
-            plot!(plt, time_axis, ts, label="$key ($(scheme_names[j][1:end-5]))", color=color,
-                  linestyle=linestyles[j], linewidth=2)
+Returns Z where Z[j,i] = field(xs[i], ys[j]) (i = x index, j = y index),
+which matches Plots.heatmap(x, y, Z) conventions.
+"""
+function objective_grid_from_field(field::Function, xs, ys)
+    Z = Matrix{Float64}(undef, length(ys), length(xs))
+    @inbounds for (j, y) in enumerate(ys)
+        for (i, x) in enumerate(xs)
+            Z[j,i] = field(x, y)
         end
     end
-
-    plt
+    return Z
 end
+
+"""
+    objective_grid_from_mdp(mdp, xs, ys) -> Matrix
+
+Uses mdp.obj(s)[1] as the scalar objective/reward at (x,y).
+"""
+function objective_grid_from_mdp(mdp::KAgentPOMDP, xs, ys)
+    Z = Matrix{Float64}(undef, length(ys), length(xs))
+    @inbounds for (j, y) in enumerate(ys)
+        for (i, x) in enumerate(xs)
+            s = _state_at_xy(mdp, x, y)
+            r = mdp.obj(s)[1]
+            Z[j,i] = Float64(r)
+        end
+    end
+    return Z
+end
+
+"""
+    xy_path_from_state_matrix(S; xy_rows=(1,2)) -> (xs, ys)
+
+Your cleaned data uses `data.data[:s]` with x,y in the first two rows
+(after your data_cleaner trimming). This helper extracts the trajectory.
+
+- S is (n_features × T)
+- returns vectors length T
+"""
+function xy_path_from_state_matrix(S::AbstractMatrix; xy_rows::Tuple{Int,Int}=(1,2))
+    rx, ry = xy_rows
+    T = size(S, 2)
+    xs = Vector{Float64}(undef, T)
+    ys = Vector{Float64}(undef, T)
+    @inbounds for t in 1:T
+        xs[t] = Float64(S[rx, t])
+        ys[t] = Float64(S[ry, t])
+    end
+    return xs, ys
+end
+
+"""
+    greedy_action_symbol_from_boltzmann(π_dist, key, s) -> (a_sym, a_idx)
+
+Uses your existing proposal_boltzmann(...) machinery to compute a Boltzmann
+distribution over actions and then selects argmax (greedy).
+
+This gives a deterministic rollout for visual comparison.
+"""
+function greedy_action_symbol_from_boltzmann(π_dist::ScoreΠDist, key, s::KAgentState)
+    b = vec(proposal_boltzmann(π_dist, key, s))
+    # guard against tiny negatives/nans
+    b = max.(b, 0.0)
+    if !(isfinite(sum(b))) || sum(b) <= 0
+        # fall back to uniform if something went wrong numerically
+        b .= 1.0
+    end
+    aidx = argmax(b)
+    asymb = π_alist(π_dist)[aidx]
+    return asymb, aidx
+end
+
+"""
+    rollout_greedy_policy(π_dist, key; start_state, T) -> (xs, ys, states)
+
+Rolls out the policy induced by the proposal's Q-function on its own MDP.
+Uses greedy selection from the Boltzmann distribution (argmax over actions).
+"""
+function rollout_greedy_policy(π_dist::ScoreΠDist, key;
+                               start_state::KAgentState,
+                               T::Int)
+    mdp = ensure_mdp!(π_dist, key)
+    s = copy(start_state)
+    xs = Vector{Float64}(undef, T)
+    ys = Vector{Float64}(undef, T)
+    states = Vector{KAgentState}(undef, T)
+
+    @inbounds for t in 1:T
+        xs[t] = Float64(s.x[1,1])
+        ys[t] = Float64(s.x[1,2])
+        states[t] = copy(s)
+
+        asymb, _ = greedy_action_symbol_from_boltzmann(π_dist, key, s)
+
+        # Transition using the POMDP generative step like in inference_model
+        s = POMDPs.@gen(:sp)(mdp, s, asymb)
+    end
+
+    return xs, ys, states
+end
+
+"""
+    top_key(pf_state, π_dist) -> (key, prob)
+
+Convenience accessor for top posterior objective key.
+"""
+function top_key(pf_state, π_dist::ScoreΠDist)
+    tops = top_objectives(pf_state, π_dist; topk=1)
+    isempty(tops) && error("top_objectives returned empty; cannot plot.")
+    return tops[1].key, tops[1].prob
+end
+
+"""
+    plot_top_objective_with_trajectories(pf_state, π_dist, agent_params;
+                                         observed_state_matrix,
+                                         gridsize=140,
+                                         xy_rows=(1,2),
+                                         show_predicted=true,
+                                         title_prefix="Top objective")
+
+Heatmap of the inferred top objective function, overlaying:
+- observed agent trajectory (from data)
+- predicted rollout under the inferred objective's MDP+policy (greedy)
+
+Returns a Plots.jl plot object.
+"""
+function plot_top_objective_with_trajectories(pf_state, π_dist::ScoreΠDist, agent_params::Dict;
+                                             observed_state_matrix::AbstractMatrix,
+                                             gridsize::Int=140,
+                                             xy_rows::Tuple{Int,Int}=(1,2),
+                                             show_predicted::Bool=true,
+                                             title_prefix::String="Top objective")
+
+    key, prob = top_key(pf_state, π_dist)
+
+    # Build inferred scalar field from decoded params
+    ff = decode_fourier_key(key, π_dist.fourier_cfg)
+    field = make_fourier_scalar_field(ff; scaleQ=true)
+
+    # Need an mdp for plotting bounds (use cached/ensured proposal mdp)
+    mdp_hat = ensure_mdp!(π_dist, key)
+    xs_grid, ys_grid = _grid_from_mdp(mdp_hat; gridsize=gridsize)
+
+    Z = objective_grid_from_field(field, xs_grid, ys_grid)
+
+    # Observed trajectory
+    obs_x, obs_y = xy_path_from_state_matrix(observed_state_matrix; xy_rows=xy_rows)
+    T = length(obs_x)
+
+    p = heatmap(xs_grid, ys_grid, Z;
+               aspect_ratio=1,
+               title="$(title_prefix) (posterior ≈ $(prob))",
+               xlabel="x", ylabel="y",
+               colorbar_title="objective")
+
+    plot!(p, obs_x, obs_y; label="observed", linewidth=3)
+
+    if show_predicted
+        start_state = agent_params[:start_state]
+        pred_x, pred_y, _ = rollout_greedy_policy(π_dist, key; start_state=start_state, T=T)
+        plot!(p, pred_x, pred_y; label="predicted (greedy)", linewidth=3, linestyle=:dash)
+    end
+
+    # Mark start/end for quick visual sanity
+    scatter!(p, [obs_x[1]], [obs_y[1]]; label="obs start", markersize=6)
+    scatter!(p, [obs_x[end]], [obs_y[end]]; label="obs end", markersize=6)
+
+    return p
+end
+
+"""
+    plot_objective_side_by_side(pf_state, π_dist;
+                                observed_mdp,
+                                gridsize=140,
+                                title_left="Inferred top objective",
+                                title_right="Observed MDP objective")
+
+Side-by-side heatmaps:
+- inferred top objective field (from Fourier features)
+- observed MDP objective (mdp.obj(s)[1])
+
+Returns a Plots.jl plot object with layout (1,2).
+"""
+function plot_objective_side_by_side(pf_state, π_dist::ScoreΠDist;
+                                    observed_mdp::KAgentPOMDP,
+                                    gridsize::Int=140,
+                                    title_left::String="Inferred top objective",
+                                    title_right::String="Observed MDP objective")
+
+    key, prob = top_key(pf_state, π_dist)
+
+    ff = decode_fourier_key(key, π_dist.fourier_cfg)
+    field = make_fourier_scalar_field(ff; scaleQ=true)
+
+    # Use observed mdp bounds for both to make comparison apples-to-apples
+    xs_grid, ys_grid = _grid_from_mdp(observed_mdp; gridsize=gridsize)
+
+    Z_inf = objective_grid_from_field(field, xs_grid, ys_grid)
+    Z_obs = objective_grid_from_mdp(observed_mdp, xs_grid, ys_grid)
+
+    p1 = heatmap(xs_grid, ys_grid, Z_inf;
+                 aspect_ratio=1,
+                 title="$(title_left)\n(posterior ≈ $(prob))",
+                 xlabel="x", ylabel="y",
+                 colorbar_title="objective")
+
+    p2 = heatmap(xs_grid, ys_grid, Z_obs;
+                 aspect_ratio=1,
+                 title=title_right,
+                 xlabel="x", ylabel="y",
+                 colorbar_title="objective")
+
+    return plot(p1, p2; layout=(1,2))
+end
+
+#########################
+### Example call-sites ###
+#########################
+
+# After running:
+#   filter_state = particle_filter(...)
+# You likely have:
+#   mdp           :: KAgentPOMDP        (observed)
+#   agent_params  :: Dict              (constructed from mdp, includes :start_state)
+#   data.data[:s] :: Matrix (features × T)
+#
+# Example: plot inferred heatmap + observed vs predicted trajectories over first 12 steps
+#
+# observed_state_matrix = data.data[:s][:, 1:12]
+# p_traj = plot_top_objective_with_trajectories(filter_state, π_dist, agent_params;
+#                                               observed_state_matrix=observed_state_matrix,
+#                                               gridsize=160,
+#                                               xy_rows=(1,2),
+#                                               show_predicted=true,
+#                                               title_prefix="Top inferred objective")
+# display(p_traj)
+#
+# Example: side-by-side objective sanity check
+# p_side = plot_objective_side_by_side(filter_state, π_dist; observed_mdp=mdp, gridsize=160)
+# display(p_side)
+
 
 #################
 ### Scripting ###
@@ -623,6 +1293,58 @@ function data_cleaner(data::ExperienceBuffer, state_field_sizes::Vector{Int64}=[
     return data
 end
 
+"""
+    onehot_cols_to_aidx(A::AbstractMatrix) -> Vector{Int}
+
+Convert action matrix A (nactions × T) where each column is one-hot
+(or nearly one-hot) into indices aidx[t] ∈ 1:nactions.
+
+Uses argmax per column. Returns vector of integer indices.
+"""
+function onehot_cols_to_aidx(A::AbstractMatrix; tol::Real=1e-8)
+    na, T = size(A)
+    aidx = Vector{Int}(undef, T)
+    @inbounds for t in 1:T
+        col = view(A, :, t)
+        # index of maximum entry (should map as idx within actions(mdp))
+        aidx[t] = argmax(col)
+    end
+    return aidx
+end
+
+"""
+    agent_params_from_mdp(mdp::KAgentPOMDP) -> Dict{Symbol,Any}
+
+Extracts all non-objective agent and environment parameters from an existing
+`KAgentPOMDP`, so that new POMDPs can be constructed with identical dynamics,
+geometry, noise, discounting, etc., but a different objective function.
+
+The returned dictionary is compatible with `build_kagent_pomdp(agent_params, obj)`.
+"""
+function agent_params_from_mdp(mdp::KAgentPOMDP)
+    return Dict(
+        # --- required ---
+        :start        => mdp.start,
+        :start_state  => rand(initialstate(mdp)),
+        :dimensions   => mdp.dimensions,
+        :menv         => mdp.menv,
+
+        # --- dynamics / noise ---
+        :agent_width  => mdp.width,
+        :agent_speed  => mdp.s,
+        :ag_mvt_noise => mdp.w,
+        :obs_noise    => mdp.v,
+        :mdp_discount => mdp.γ,
+
+        # --- geometry ---
+        :obcs         => mdp.obcs,
+        :goals        => Any[],
+
+        # --- misc ---
+        :digits       => mdp.digits
+    )
+end
+
 println("Directory is: ", @__DIR__)
 
 script_dir = @__DIR__
@@ -635,31 +1357,14 @@ anon_data = data_cleaner(anon_data, [2,2,12,10,1], Bool[1,1,1,0,1])
 π_iql, 𝒟_iql, mdp, f = quick_IQL(kworld, anon_data; plot_metrics=false)
 action_list = [actions(mdp), a->Flux.onehot(a, actions(mdp)), Flux.onehotbatch(actions(mdp), actions(mdp))]
 
-lazy_precompute = true
-possible_goals = [
-        (:ne, Dict(:target=>[9.5 9.5], :strength=>10., :influence=>5., :size=>0.75)),
-        (:nw, Dict(:target=>[2.5 9.5], :strength=>10., :influence=>5., :size=>0.75)),
-        (:se, Dict(:target=>[9.5 2.5], :strength=>10., :influence=>5., :size=>0.75)),
-        (:sw, Dict(:target=>[1.5 2.5], :strength=>10., :influence=>5., :size=>0.75)),
-        (:c, Dict(:target=>[5.5 5.5], :strength=>10., :influence=>5., :size=>0.75)),
-        (:e, Dict(:target=>[9.5 5.5], :strength=>10., :influence=>5., :size=>0.75)),
-        (:w, Dict(:target=>[1.5 5.5], :strength=>10., :influence=>5., :size=>0.75)),
-        (:n, Dict(:target=>[1.5 9.5], :strength=>10., :influence=>5., :size=>0.75)),
-        (:s, Dict(:target=>[1.5 1.5], :strength=>10., :influence=>5., :size=>0.75)),
-]
+π_dist = ScoreΠDist(; mdp_params = action_list)
 
-# kworld_infer = kworld_for_inference(kworld.glob_landscape.goals[1:end-1]; known_kworld=kworld)
-kworld_infer = kworld_for_inference(possible_goals[1:3];
-                                    known_obcs=kworld.glob_landscape.obstacles, known_env=mdp.menv, dims=mdp.dimensions)
-if lazy_precompute
-    π_dist = lazy_precompute_π_dist(kworld_infer; solver_type=:dql, solver_params=[:softq, 2000], π_iql=π_iql, mdp_params=action_list)
-    println("Lazily precomputing proposal distribution π-dist")
-else
-    π_dist = precompute_π_dist(kworld_infer; solver_type=:dql, solver_params=[:softq, 2000], π_iql=π_iql, mdp_params=action_list)
-    println("Precomputing proposal distribution π-dist")
-end
+# relevant_data = anon_data.data[:a][:,1:12]
+relevant_data = onehot_cols_to_aidx(anon_data.data[:a][:,1:12])
+start_state = blindstart_KAgentState(mdp, reshape(data.data[:s][:,1][1:2], (1,2)))
+agent_params = agent_params_from_mdp(mdp)
+state_data = data.data[:s][:,1:12]
 
-relevant_data = anon_data.data[:a][:,1:12]
-start_loc = blindstart_KAgentState(mdp, reshape(data.data[:s][:,1][1:2], (1,2)))
+iql_state_data, iql_obs_aidx, iql_locs = surrogate_dataset_from_iql_grid(π_dist, π_iql, mdp; eval_num=400)
 
-filter_state = particle_filter(relevant_data, π_dist, start_loc, 1000)
+filter_state = particle_filter(relevant_data, π_dist, agent_params, state_data, 100; ess_thresh=0.7)
