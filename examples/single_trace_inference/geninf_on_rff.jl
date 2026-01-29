@@ -1341,7 +1341,8 @@ function agent_params_from_mdp(mdp::KAgentPOMDP)
         :goals        => Any[],
 
         # --- misc ---
-        :digits       => mdp.digits
+        :digits       => mdp.digits,
+        :policy_temperature => 2.0
     )
 end
 
