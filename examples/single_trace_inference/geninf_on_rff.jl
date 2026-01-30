@@ -1,6 +1,7 @@
 using MuKumari
 
 using LinearAlgebra: norm, normalize
+using Statistics: std
 using Combinatorics: powerset
 
 using POMDPTools, MCTS, POMDPLinter
@@ -129,7 +130,7 @@ function quick_IQL(mdp::KAgentPOMDP, anon_data::ExperienceBuffer)
 
     π_iql = solve(𝒟_iql, mdp)
 
-    return π_iql, 𝒟_iql, mdp, f
+    return π_iql, 𝒟_iql, mdp
 end
 
 #################################
@@ -1357,6 +1358,8 @@ function load_runpacks(bson_path::AbstractString)
 
             for k in 1:length(insts)
                 full_buf, anon_buf = insts[k]
+                full_buf = data_cleaner(full_buf, [2,2,12,10,1],Bool[1,1,1,0,1])
+                anon_buf = data_cleaner(anon_buf, [2,2,12,10,1],Bool[1,1,1,0,1])
                 name = agent * "_" * string(k)
                 mdp  = kworld.inhabitants[name]  # matches generator naming
                 push!(packs, RunPack(rid, agent, k, mdp, full_buf, anon_buf, ann))
@@ -1377,8 +1380,8 @@ function eval_pack(pack::RunPack;
                    ess_thresh::Float64=0.7,
                    refine_every::Int=5,
                    refine_topk::Int=5,
-                   real_T::Int=12,
-                   iql_gridN::Int=400)
+                   iql_gridN::Int=100,
+                   minN::Int=20)
 
     mdp = pack.mdp
 
@@ -1396,13 +1399,17 @@ function eval_pack(pack::RunPack;
 
     # 3) agent_params from mdp
     agent_params = agent_params_from_mdp(mdp)
+    T = size(pack.full.data[:s], 2) # num of cols in state # TODO: should be ...data.elements
+
+    # 4) Decide on T
+    data_slices = (T ≤ minN) ? collect(1:T) : [rand(1:T) for _ in 1:minN]
 
     ########################
     # Mode A: real dataset
     ########################
     # PF uses (state_data[:,1:T], aidx[1:T]) from the full buffer
-    state_data = pack.full.data[:s][:, 1:real_T]
-    obs_aidx   = onehot_cols_to_aidx(pack.full.data[:a][:, 1:real_T])
+    state_data = pack.full.data[:s][:, data_slices]
+    obs_aidx   = onehot_cols_to_aidx(pack.full.data[:a][:, data_slices])
 
     pf_real = particle_filter(obs_aidx, π_dist, agent_params, state_data, n_particles;
                               ess_thresh=ess_thresh, refine_every=refine_every, refine_topk=refine_topk)
@@ -1426,14 +1433,6 @@ function eval_pack(pack::RunPack;
         real = (state_data=state_data, obs_aidx=obs_aidx),
         iql  = (state_data=iql_state_data, obs_aidx=iql_obs_aidx)
     )
-end
-
-function eval_all(packs::Vector{RunPack}; kwargs...)
-    out = Vector{Any}(undef, length(packs))
-    for i in eachindex(packs)
-        out[i] = eval_pack(packs[i]; kwargs...)
-    end
-    return out
 end
 
 #############################
@@ -1490,11 +1489,13 @@ function objective_recon_metrics(pf_state, π_dist, mdp; gridsize::Int=120)
 end
 
 # --- “policy matches true actions at true states” for top key (greedy argmax) ---
-function policy_match_acc(pf_state, π_dist, agent_params, state_data, obs_aidx; temperature::Float64=1.0)
+function policy_match_acc(pf_state, π_dist, agent_params, state_data, obs_aidx)
     tops = top_objectives(pf_state, π_dist; topk=1)
     isempty(tops) && return (acc=NaN, N=0)
     key = tops[1].key
     mdp_hat = ensure_mdp!(π_dist, key)
+
+    temperature = get(agent_params, :policy_temperature, 1.0)
 
     T = length(obs_aidx)
     pred = Vector{Int}(undef, T)
@@ -1521,8 +1522,7 @@ function summarize_eval(evals; n_particles::Int, gridsize::Int=120)
         # Real-mode metrics
         degR = pf_degeneracy(E.pf_real, E.π_dist; n_particles=n_particles)
         objR = objective_recon_metrics(E.pf_real, E.π_dist, E.mdp; gridsize=gridsize)
-        polR = policy_match_acc(E.pf_real, E.π_dist, E.agent_params, E.real.state_data, E.real.obs_aidx;
-                                temperature=get(E.agent_params, :policy_temperature, 1.0))
+        polR = policy_match_acc(E.pf_real, E.π_dist, E.agent_params, E.real.state_data, E.real.obs_aidx)
 
         push!(rows_real, (
             run_id=pack.run_id, agent=pack.agent, inst=pack.inst,
@@ -1535,8 +1535,7 @@ function summarize_eval(evals; n_particles::Int, gridsize::Int=120)
         # IQL-surrogate-mode metrics (policy_acc computed against surrogate actions at surrogate states)
         degI = pf_degeneracy(E.pf_iql, E.π_dist; n_particles=n_particles)
         objI = objective_recon_metrics(E.pf_iql, E.π_dist, E.mdp; gridsize=gridsize)
-        polI = policy_match_acc(E.pf_iql, E.π_dist, E.agent_params, E.iql.state_data, E.iql.obs_aidx;
-                                temperature=get(E.agent_params, :policy_temperature, 1.0))
+        polI = policy_match_acc(E.pf_iql, E.π_dist, E.agent_params, E.iql.state_data, E.iql.obs_aidx)
 
         push!(rows_iql, (
             run_id=pack.run_id, agent=pack.agent, inst=pack.inst,
@@ -1554,27 +1553,1369 @@ end
 # One-shot entrypoint
 #####################
 
+"Feature vector used to diversify ordering."
+pack_feat(p) = Float64[p.ann.num_goals, p.ann.num_obstacles, p.ann.max_goal_separation]
+
+"Greedy farthest-next ordering to maximize diversity between consecutive packs."
+function diversify_packs(packs::Vector{RunPack})
+    n = length(packs)
+    n <= 2 && return packs
+
+    F = [pack_feat(p) for p in packs]
+
+    # Normalize each feature dimension for sane distances
+    M = reduce(hcat, F)  # 3×n
+    μ = mean(M, dims=2)
+    σ = std(M, dims=2)
+    σ .= max.(σ, 1e-9)
+    Mz = (M .- μ) ./ σ
+
+    # Start at an extreme point (max norm) to reduce dependence on initial ordering
+    norms = vec(sum(abs2, Mz; dims=1))
+    start = argmax(norms)
+
+    order = Int[start]
+    remaining = Set(1:n)
+    delete!(remaining, start)
+
+    while !isempty(remaining)
+        last = order[end]
+        best_i = first(remaining)
+        best_d = -Inf
+        @inbounds for i in remaining
+            d = sum(abs2, Mz[:, i] .- Mz[:, last])  # squared L2
+            if d > best_d
+                best_d = d
+                best_i = i
+            end
+        end
+        push!(order, best_i)
+        delete!(remaining, best_i)
+    end
+
+    return packs[order]
+end
+
+function eval_all(packs::Vector{RunPack}; max_tests::Int=1000,
+                  kwargs...)
+    packs2 = diversify_packs(packs)
+    N = min(length(packs2), max_tests)
+    out = Vector{Any}(undef, N)
+    for i in 1:N
+        out[i] = eval_pack(packs2[i]; kwargs...)
+    end
+    return out
+end
+
 function multi_run_test(bson_path::AbstractString;
+                        max_tests::Int=1000,
                         n_particles::Int=50,
                         ess_thresh::Float64=0.7,
                         refine_every::Int=5,
                         refine_topk::Int=5,
-                        real_T::Int=12,
+                        minN::Int=20,
                         iql_gridN::Int=80,
                         gridsize::Int=120)
 
     packs = load_runpacks(bson_path)
     evals = eval_all(packs;
+                     max_tests=max_tests,
                      n_particles=n_particles,
                      ess_thresh=ess_thresh,
                      refine_every=refine_every,
                      refine_topk=refine_topk,
-                     real_T=real_T,
+                     minN=minN,
                      iql_gridN=iql_gridN)
 
     return summarize_eval(evals; n_particles=n_particles, gridsize=gridsize)
 end
 
+############################################
+# New testing suite: ablation over objectives
+############################################
+
+using Random
+using Statistics
+using LinearAlgebra: norm
+using Plots
+
+############################
+# 0) Small util helpers
+############################
+
+"""
+    safe_get_obstacle_count(mdp_or_pack)
+
+Prefer annotations from RunPack when available; else fall back to mdp.obcs length.
+"""
+function safe_get_obstacle_count(x)
+    if hasproperty(x, :ann)
+        return getproperty(x.ann, :num_obstacles)
+    end
+    if hasproperty(x, :obcs)
+        return length(getproperty(x, :obcs))
+    end
+    return missing
+end
+
+"""
+    randcat(rng, p)
+
+Sample an index in 1:length(p) with probabilities p (assumed nonnegative, not necessarily normalized).
+"""
+function randcat(rng::AbstractRNG, p::AbstractVector{<:Real})
+    s = 0.0
+    @inbounds for i in eachindex(p)
+        s += float(p[i])
+    end
+    u = rand(rng) * s
+    c = 0.0
+    @inbounds for i in eachindex(p)
+        c += float(p[i])
+        if u <= c
+            return Int(i)
+        end
+    end
+    return Int(lastindex(p))  # numerical fallback
+end
+
+############################
+# ExperienceBuffer creation (exact signature)
+############################
+
+"""
+    mk_experience_buffer(data::Dict)
+
+Construct exactly: ExperienceBuffer(data, max_steps, 1, Array{Int64}[], nothing, 0)
+where max_steps is the number of columns in data[:s].
+"""
+function mk_experience_buffer(data::Dict{Symbol, Matrix})
+    max_steps = size(data[:s], 2)
+    return ExperienceBuffer(data, max_steps, 1, Array{Int64}[], nothing, 0)
+end
+
+function alloc_buffer_dict(obs_dims::Int, a_dims::Int, max_steps::Int)
+    a_list = Matrix{Bool}(undef, a_dims, max_steps)
+
+    s_list  = zeros(Float64, obs_dims, max_steps)
+    sp_list = zeros(Float64, obs_dims, max_steps)
+
+    expert_val_list = ones(Float32, 1, max_steps)
+    r_list   = Matrix{Float64}(undef, 1, max_steps)
+    t_list   = Matrix{Int64}(undef, 1, max_steps)
+    done_list = Matrix{Bool}(undef, 1, max_steps)
+
+    # initialize the ones that must be deterministic
+    t_list[1, :] .= collect(Int64, 1:max_steps)
+    done_list[1, :] .= false
+
+    return Dict(
+        :a => a_list,
+        :s => s_list,
+        :sp => sp_list,
+        :r => r_list,
+        :t => t_list,
+        :expert_val => expert_val_list,
+        :done => done_list,
+    )
+end
+
+"""
+    wrap_like(template_buf, data)
+
+Create a new ExperienceBuffer by cloning `template_buf` and replacing `.data`
+(and step counters) so Crux/IQL code accepts it.
+"""
+function wrap_like(template_buf, data::Dict{Symbol,Any})
+    buf = deepcopy(template_buf)
+    buf.data = data
+    if hasproperty(buf, :elements)
+        buf.elements = size(data[:s], 2)
+    end
+    if hasproperty(buf, :max_steps)
+        buf.max_steps = size(data[:s], 2)
+    end
+    return buf
+end
+
+"""
+    anonymize_buffer_location!(buf)
+
+Zeroes out the first two rows (location dims) of :s and :sp.
+Works in-place on ExperienceBuffer (buf.data is a Dict).
+"""
+function anonymize_buffer_location!(buf)
+    @assert hasproperty(buf, :data) "Expected an ExperienceBuffer-like object with `.data`"
+    D = buf.data
+    @assert haskey(D, :s) && haskey(D, :sp) "Buffer data missing :s or :sp"
+
+    @assert size(D[:s], 1) ≥ 2 && size(D[:sp], 1) ≥ 2 "State obs dim < 2; cannot anonymize first two rows"
+
+    D[:s][1:2, :] .= 0.0
+    D[:sp][1:2, :] .= 0.0
+    return buf
+end
+
+############################
+# Rollout to produce ExperienceBuffer for 20 steps
+############################
+
+"""
+    qpolicy_action(π, mdp, s; temperature=1.0, rng=...)
+
+Same as before: choose action by Boltzmann over Q-values.
+Returns (a::Symbol, aidx::Int, probs::Vector{Float64})
+"""
+function qpolicy_action(π, mdp::KAgentPOMDP, s::KAgentState;
+                        temperature::Real=1.0,
+                        rng=Random.default_rng())
+
+    as = actions(mdp)
+    all_a_onehot = Flux.onehotbatch(as, as)
+    obs = MuKumari.shape_state_as_obs(mdp, s)
+
+    q = vec(Crux.value(π, obs, all_a_onehot))
+    qmax = maximum(q)
+    logits = (q .- qmax) ./ temperature
+    p = exp.(logits)
+    p ./= sum(p)
+
+    aidx = randcat(rng, p)
+    return as[aidx], aidx, Float64.(p)
+end
+
+"""
+    rollout_experience_buffer(mdp, π; T=20, temperature=1.0, rng=...)
+
+Generates the exact ExperienceBuffer requested:
+- state vectors are observation-vector format (via MuKumari.shape_state_as_obs)
+- done flags are all false (per your spec)
+- timestamps 1..T
+"""
+function rollout_experience_buffer(mdp::KAgentPOMDP, π;
+                                   T::Int=20,
+                                   temperature::Real=1.0,
+                                   rng=Random.default_rng())
+
+    as = actions(mdp)
+    na = length(as)
+
+    # Determine obs dimension robustly
+    s0 = rand(initialstate(mdp))
+    obs0 = MuKumari.shape_state_as_obs(mdp, s0)
+    obs_dim = length(obs0)
+
+    data = alloc_buffer_dict(obs_dim, na, T)
+
+    s = s0
+    for t in 1:T
+        a, aidx, _ = qpolicy_action(π, mdp, s; temperature=temperature, rng=rng)
+
+        # transition
+        nt = POMDPs.gen(mdp, s, a, rng)
+        sp = nt.sp
+        r  = nt.r
+
+        # store onehot action column (Bool matrix)
+        data[:a][:, t] .= false
+        data[:a][aidx, t] .= true
+
+        # store obs-shaped state, next-state
+        data[:s][:, t]  .= Float64.(shape_state_as_obs(mdp, s))
+        data[:sp][:, t] .= Float64.(shape_state_as_obs(mdp, sp))
+
+        # store reward (1×T)
+        data[:r][1, t] = Float64(r)
+
+        # timestamps already filled; done must remain all false per your spec
+        # data[:done][1, t] = false  # redundant; already false
+
+        s = sp
+    end
+
+    return mk_experience_buffer(data)
+end
+
+"""
+    build_shared_menv(; M=3)
+
+Your requirement: all test MDPs share the same MuEnv.
+You can replace μfs with whatever you want; this is a stable default.
+"""
+function build_shared_menv(; M::Int=3)
+    μfs = [
+        (:sin, x->sin(x[1]) + cos(x[2])),
+        (:exp, x->100*exp(-norm(x.-[8 8.])^2 / 1.0)),
+        (:lin, x->x[1]^2 + x[2])
+    ]
+    μs = Symbol[μfs[i][1] for i in 1:M]
+    return MuEnv(M, μs, Dict(μfs))
+end
+
+############################
+# 1) Select 25 skeleton MDPs
+############################
+
+"""
+    select_skeleton_mdps(bson_path; nbins=5, per_bin=5, rng=Random.default_rng())
+
+Loads RunPacks, counts them, bins by obstacle count (least→most), and selects `per_bin` packs per bin.
+Returns:
+- packs_all
+- chosen_packs (length nbins*per_bin)
+- bin_info (NamedTuple with boundaries and counts)
+"""
+function select_skeleton_mdps(bson_path::AbstractString;
+                              nbins::Int=5,
+                              per_bin::Int=5,
+                              rng=Random.default_rng())
+
+    packs_all = load_runpacks(bson_path)
+    N_total = length(packs_all)
+
+    # Sort by obstacle count ascending
+    obs = [p.ann.num_obstacles for p in packs_all]
+    order = sortperm(obs)
+    packs_sorted = packs_all[order]
+    obs_sorted = obs[order]
+
+    # Split into nbins contiguous bins (equal size as possible)
+    bins = Vector{Vector{RunPack}}(undef, nbins)
+    idxs = collect(1:N_total)
+    # chunk boundaries
+    for b in 1:nbins
+        lo = floor(Int, (b-1)*N_total/nbins) + 1
+        hi = floor(Int, b*N_total/nbins)
+        bins[b] = packs_sorted[lo:hi]
+    end
+
+    chosen = RunPack[]
+    boundaries = NamedTuple[]
+
+    for (b, binpacks) in enumerate(bins)
+        binN = length(binpacks)
+        if binN == 0
+            push!(boundaries, (bin=b, min_obstacles=missing, max_obstacles=missing, count=0))
+            continue
+        end
+        mino = minimum(p.ann.num_obstacles for p in binpacks)
+        maxo = maximum(p.ann.num_obstacles for p in binpacks)
+
+        push!(boundaries, (bin=b, min_obstacles=mino, max_obstacles=maxo, count=binN))
+
+        k = min(per_bin, binN)
+        picks = randperm(rng, binN)[1:k]
+        append!(chosen, binpacks[picks])
+    end
+
+    return packs_all, chosen, (total=N_total, nbins=nbins, per_bin=per_bin, boundaries=boundaries)
+end
+
+############################
+# 2) Generate 30 ablation objectives
+############################
+
+"""
+Internal: sample discrete Fourier indices with an override for K and with controllable supports.
+Returns (key, ff_namedtuple, sweep_tag, sweep_level, cfg_used)
+"""
+function sample_fourier_key(cfg::FourierDiscreteCfg;
+                            K_override::Union{Nothing,Int}=nothing,
+                            rng=Random.default_rng())
+
+    # Supports/probs
+    Kp = K_probs(cfg)
+    freq_supp, freq_w = freq_bin_support_and_probs(cfg)
+    amp_supp, amp_w   = amp_bin_support_and_probs(cfg)
+
+    K = isnothing(K_override) ? rand(rng, Categorical(Kp)) : K_override
+    K = clamp(K, 1, cfg.Kmax)
+
+    fx_idx = Vector{Int}(undef, K)
+    fy_idx = Vector{Int}(undef, K)
+    A_idx  = Vector{Int}(undef, K)
+    ϕ_idx  = Vector{Int}(undef, K)
+
+    for m in 1:K
+        fx_idx[m] = freq_supp[randcat(rng, freq_w)]
+        fy_idx[m] = freq_supp[randcat(rng, freq_w)]
+        A_idx[m]  = amp_supp[randcat(rng, amp_w)]
+        ϕ_idx[m]  = rand(rng, 0:cfg.P-1)
+    end
+
+    key = (K, fx_idx, fy_idx, A_idx, ϕ_idx)
+    return key
+end
+
+"""
+    build_ablation_objectives(; rng=..., base_cfg=FourierDiscreteCfg(), levels=10)
+
+Creates 30 objectives total:
+- sweep=:K (10 objs): K in [1..10], with narrow freq/amp ranges
+- sweep=:freq_range (10 objs): Fmax_i increases, K fixed at 2
+- sweep=:amp_range (10 objs): Amax_i increases, K fixed at 2
+
+Returns Vector of NamedTuples with fields:
+(id, sweep, level, cfg, key, field, obj)
+"""
+function build_ablation_objectives(; rng=Random.default_rng(),
+                                   base_cfg::FourierDiscreteCfg=FourierDiscreteCfg(),
+                                   levels::Int=10)
+
+    out = NamedTuple[]
+
+    # Sweep A: number of features K (keep freq/amp “similar”: small ranges)
+    # Choose narrow supports by using small Fmax_i and small Amax_i.
+    cfgK = FourierDiscreteCfg(; Kmax=24,
+                             λK=base_cfg.λK,
+                             Δf=base_cfg.Δf, Fmax_i=3, freq_mag_decay=0.0,
+                             ΔA=base_cfg.ΔA, Amax_i=6,
+                             P=base_cfg.P)
+
+    for i in 1:levels
+        K = i  # 1..10
+        key = sample_fourier_key(cfgK; K_override=K, rng=rng)
+        # decode indices -> actual values (fx, fy, A, ϕ)
+        ff = decode_fourier_key(key, cfgK)
+        field = make_fourier_scalar_field(ff; scaleQ=true)
+        obj   = make_pomdp_objective_from_field(field)
+        push!(out, (id=length(out)+1, sweep=:K, level=K, cfg=cfgK, key=key, field=field, obj=obj))
+    end
+
+    # Sweep B: frequency range (keep K=2, amplitude range fixed)
+    # “Similar freq values” -> small Fmax_i; “very different” -> large Fmax_i.
+    cfgF_base = FourierDiscreteCfg(; Kmax=24,
+                                  λK=base_cfg.λK,
+                                  Δf=base_cfg.Δf,
+                                  Fmax_i=3, freq_mag_decay=0.0,
+                                  ΔA=base_cfg.ΔA, Amax_i=base_cfg.Amax_i,  # keep amplitude range fixed
+                                  P=base_cfg.P)
+
+    F_levels = round.(Int, range(2, 30; length=levels))  # monotone increase
+    for Fmax in F_levels
+        cfgF = FourierDiscreteCfg(; Kmax=cfgF_base.Kmax, λK=cfgF_base.λK,
+                                 Δf=cfgF_base.Δf, Fmax_i=Fmax, freq_mag_decay=cfgF_base.freq_mag_decay,
+                                 ΔA=cfgF_base.ΔA, Amax_i=cfgF_base.Amax_i,
+                                 P=cfgF_base.P)
+        key = sample_fourier_key(cfgF; K_override=2, rng=rng)
+        ff = decode_fourier_key(key, cfgF)
+        field = make_fourier_scalar_field(ff; scaleQ=true)
+        obj   = make_pomdp_objective_from_field(field)
+        push!(out, (id=length(out)+1, sweep=:freq_range, level=Fmax, cfg=cfgF, key=key, field=field, obj=obj))
+    end
+
+    # Sweep C: amplitude range (keep K=2, frequency range fixed)
+    cfgA_base = FourierDiscreteCfg(; Kmax=24,
+                                  λK=base_cfg.λK,
+                                  Δf=base_cfg.Δf, Fmax_i=base_cfg.Fmax_i, freq_mag_decay=base_cfg.freq_mag_decay,
+                                  ΔA=base_cfg.ΔA, Amax_i=3,
+                                  P=base_cfg.P)
+
+    A_levels = round.(Int, range(2, 50; length=levels))
+    for Amax in A_levels
+        cfgA = FourierDiscreteCfg(; Kmax=cfgA_base.Kmax, λK=cfgA_base.λK,
+                                 Δf=cfgA_base.Δf, Fmax_i=cfgA_base.Fmax_i, freq_mag_decay=cfgA_base.freq_mag_decay,
+                                 ΔA=cfgA_base.ΔA, Amax_i=Amax,
+                                 P=cfgA_base.P)
+        key = sample_fourier_key(cfgA; K_override=2, rng=rng)
+        ff = decode_fourier_key(key, cfgA)
+        field = make_fourier_scalar_field(ff; scaleQ=true)
+        obj   = make_pomdp_objective_from_field(field)
+        push!(out, (id=length(out)+1, sweep=:amp_range, level=Amax, cfg=cfgA, key=key, field=field, obj=obj))
+    end
+
+    return out
+end
+
+############################
+# 3) Synthesize 30 MDPs from skeletons + shared MuEnv + empty goals
+############################
+
+"""
+    synthesize_ablation_mdps(skeleton_packs, objectives; shared_menv=build_shared_menv(), rng=...)
+
+For each objective:
+- sample one skeleton pack at random from the 25
+- extract agent_params_from_mdp(skeleton.mdp)
+- override :menv and :goals
+- build_kagent_pomdp(agent_params, obj)
+
+Returns Vector of NamedTuples:
+(id, sweep, level, mdp, agent_params, skeleton_ref, objrec)
+"""
+function synthesize_ablation_mdps(skeleton_packs::Vector{RunPack},
+                                  objectives::Vector{<:NamedTuple};
+                                  shared_menv=build_shared_menv(),
+                                  rng=Random.default_rng())
+
+    out = NamedTuple[]
+    for objrec in objectives
+        sk = rand(rng, skeleton_packs)
+        agent_params = agent_params_from_mdp(sk.mdp)
+
+        # override as requested
+        agent_params[:menv]  = shared_menv
+        agent_params[:goals] = Any[]
+
+        mdp_new = build_kagent_pomdp(agent_params, objrec.obj; name="abl_$(objrec.id)")
+
+        push!(out, (id=objrec.id,
+                    sweep=objrec.sweep,
+                    level=objrec.level,
+                    mdp=mdp_new,
+                    agent_params=agent_params,
+                    skeleton_ref=(run_id=sk.run_id, agent=sk.agent, inst=sk.inst, num_obstacles=sk.ann.num_obstacles),
+                    objrec=objrec))
+    end
+    return out
+end
+
+############################
+# 4) Train SoftQ
+############################
+
+"""
+    softq_policy(mdp; N=2000, epochs=2, batch_size=256)
+
+Trains SoftQ via your existing deep_q_solver and returns (solver, policy).
+"""
+function softq_policy(mdp::KAgentPOMDP; N::Int=2000, epochs::Int=2, batch_size::Int=256)
+    𝒮 = deep_q_solver(mdp; solver_params=[:softq, N, epochs, batch_size])
+    π = solve(𝒮, mdp)
+    return 𝒮, π
+end
+
+###########################
+# 4.5) Cache-ing!
+###########################
+
+@with_kw struct MuEnvSpec
+    variant::Symbol = :default_shared   # lets you branch later
+    M::Int = 3
+    μ_order::Vector{Symbol} = [:sin, :exp, :lin]
+end
+
+function build_shared_menv(spec::MuEnvSpec)
+    μfs = [
+        (:sin, x->sin(x[1]) + cos(x[2])),
+        (:exp, x->100*exp(-norm(x.-[8 8.])^2 / 1.0)),
+        (:lin, x->x[1]^2 + x[2])
+    ]
+    μdict = Dict(μfs)
+    return MuEnv(spec.M, spec.μ_order, μdict)
+end
+
+"""
+BSON payload structure:
+cache = Dict(
+  :meta => ...,
+  :muenv_spec => MuEnvSpec(...),
+  :records => Vector{Dict} with per-objective:
+      id, sweep, level,
+      cfg (FourierDiscreteCfg serialized ok),
+      key (Tuple K, fx_i, fy_i, A_i, ϕ_i),
+      agent_params_core (Dict without :menv / :start_state),
+      skeleton_ref,
+      full_data (Dict{Symbol,Matrix}),
+      anon_data (Dict{Symbol,Matrix})
+)
+"""
+
+function reconstruct_mdp_from_cache(rec::Dict, muenv_spec::MuEnvSpec)
+    cfg = rec[:cfg]
+    key = rec[:key]
+
+    bank = decode_fourier_key(key, cfg)                 # returns bank with fx, fy, A, ϕ
+    field = make_fourier_scalar_field(bank; scaleQ=true)
+    obj = make_pomdp_objective_from_field(field)
+
+    menv = build_shared_menv(muenv_spec)
+
+    agent_params = deepcopy(rec[:agent_params_core])
+    agent_params[:menv]  = menv
+    agent_params[:goals] = Any[]
+    # Start state should be consistent and avoid BSON-loaded mdp.menv:
+    x0 = agent_params[:start]
+    agent_params[:start_state] = KAgentState(x0, [predict_env(menv, x0)], Matrix[])
+
+    mdp = build_kagent_pomdp(agent_params, obj; name="abl_$(rec[:id])")
+    return mdp, agent_params
+end
+
+function generate_and_cache_ablation_data(bson_path::String;
+                                          cache_path::String,
+                                          rng::AbstractRNG,
+                                          shared_muenv_spec::MuEnvSpec=MuEnvSpec(),
+                                          nbins::Int=5, per_bin::Int=5,
+                                          levels::Int=10,
+                                          T::Int=20)
+
+    packs_all, skeletons, bin_info = select_skeleton_mdps(bson_path; nbins=nbins, per_bin=per_bin, rng=rng)
+
+    objectives = build_ablation_objectives(; rng=rng, levels=levels)
+
+    # IMPORTANT: do NOT call agent_params_from_mdp in a way that touches BSON-loaded mdp.menv.
+    # You already fixed that earlier by building start_state from global/shared menv.
+    mdprecs = synthesize_ablation_mdps(skeletons, objectives;
+                                       shared_menv=build_shared_menv(shared_muenv_spec),
+                                       rng=rng)
+
+    records = Vector{Dict}(undef, length(mdprecs))
+
+    for (i, rec) in enumerate(mdprecs)
+        mdp = rec.mdp
+
+        # Train SoftQ for generation
+        _, π_softq = softq_policy(mdp; N=2000, epochs=2, batch_size=256)
+
+        temperature = get(rec.agent_params, :policy_temperature, 2.0)
+        full_buf = rollout_experience_buffer(mdp, π_softq; T=T, temperature=temperature, rng=rng)
+
+        # Create anon_buf by copying data with Dict{Symbol,Matrix} typing
+        full_data = full_buf.data
+        anon_data = Dict{Symbol, Matrix}(k => copy(v) for (k,v) in full_data)
+        # zero out first two rows of :s and :sp
+        anon_data[:s][1:2, :] .= 0.0
+        anon_data[:sp][1:2, :] .= 0.0
+
+        # Store a BSON-safe “core” agent_params (NO :menv and NO :start_state)
+        ap = deepcopy(rec.agent_params)
+        pop!(ap, :menv, nothing)
+        pop!(ap, :start_state, nothing)
+
+        records[i] = Dict(
+            :id => rec.id,
+            :sweep => rec.sweep,
+            :level => rec.level,
+            :cfg => rec.objrec.cfg,
+            :key => rec.objrec.key,
+            :agent_params_core => ap,
+            :skeleton_ref => rec.skeleton_ref,
+            :full_data => Dict{Symbol, Matrix}(k => copy(v) for (k,v) in full_data),
+            :anon_data => anon_data,
+        )
+    end
+
+    cache = Dict(
+        :meta => Dict(
+            :source_bson => bson_path,
+            :nbins => nbins, :per_bin => per_bin,
+            :n_skeletons => length(skeletons),
+            :n_objectives => length(objectives),
+            :T => T,
+            :bin_info => bin_info,
+        ),
+        :muenv_spec => shared_muenv_spec,
+        :records => records,
+    )
+
+    BSON.@save cache_path cache
+    return cache
+end
+
+function load_ablation_cache(cache_path::String)
+    d = BSON.load(cache_path)
+    @assert haskey(d, :cache) "Expected BSON to contain key :cache"
+    return d[:cache]
+end
+
+############################
+# 5) Run Mode A vs Mode B + metrics, per ablation MDP
+############################
+
+"""
+    eval_ablation_mdp(rec; n_particles=..., iql_gridN=..., minN=20, ...)
+
+rec is one element from synthesize_ablation_mdps output.
+Returns NamedTuple with all metrics for modeA and modeB plus identifiers.
+"""
+function eval_ablation_mdp(rec; n_particles::Int=50, ess_thresh::Float64=0.7, refine_every::Int=5, refine_topk::Int=5,
+                           iql_gridN::Int=100, minN::Int=20, gridsize::Int=120, rng=Random.default_rng())
+
+    mdp = rec.mdp
+
+    # 1) Train SoftQ for data generation (Mode A “real” dataset)
+    _, π_softq = softq_policy(mdp; N=2000, epochs=2, batch_size=256)
+
+    # 2) Generate experience (full + anon identical here unless you want otherwise)
+    temperature = get(rec.agent_params, :policy_temperature, 2.0)
+    full_buf = rollout_experience_buffer(mdp, π_softq; T=minN, temperature=temperature, rng=rng)
+
+    anon_data = Dict{Symbol,Matrix}(k => copy(v) for (k,v) in full_buf.data)
+    anon_buf  = ExperienceBuffer(anon_data, size(anon_data[:s], 2), 1, Array{Int64}[], nothing, 0)
+    anonymize_buffer_location!(anon_buf)
+
+    # 3) Train IQL (Mode B surrogate driver)
+    π_iql, 𝒟_iql, _ = quick_IQL(mdp, anon_buf)  # uses your existing helper
+
+    # 4) Build π_dist with action mappings
+    as = actions(mdp)
+    action_list = [as, a->Flux.onehot(a, as), Flux.onehotbatch(as, as)]
+    π_dist = ScoreΠDist(; mdp_params=action_list)
+
+    # 5) Mode A PF
+    T = size(full_buf.data[:s], 2)
+    data_slices = (T ≤ minN) ? collect(1:T) : [rand(rng, 1:T) for _ in 1:minN]
+    state_dataA = full_buf.data[:s][:, data_slices]
+    obs_aidxA   = onehot_cols_to_aidx(full_buf.data[:a][:, data_slices])
+
+    pfA = particle_filter(obs_aidxA, π_dist, rec.agent_params, state_dataA, n_particles;
+                          ess_thresh=ess_thresh, refine_every=refine_every, refine_topk=refine_topk)
+
+    # 6) Mode B PF (IQL grid surrogate)
+    iql_state_data, iql_obs_aidx, _ = surrogate_dataset_from_iql_grid(π_dist, π_iql, mdp; eval_num=iql_gridN)
+
+    pfB = particle_filter(iql_obs_aidx, π_dist, rec.agent_params, iql_state_data, n_particles;
+                          ess_thresh=ess_thresh, refine_every=refine_every, refine_topk=refine_topk)
+
+    # 7) Metrics for both modes
+    degA = pf_degeneracy(pfA, π_dist; n_particles=n_particles)
+    objA = objective_recon_metrics(pfA, π_dist, mdp; gridsize=gridsize)
+    polA = policy_match_acc(pfA, π_dist, rec.agent_params, state_dataA, obs_aidxA)
+
+    degB = pf_degeneracy(pfB, π_dist; n_particles=n_particles)
+    objB = objective_recon_metrics(pfB, π_dist, mdp; gridsize=gridsize)
+    polB = policy_match_acc(pfB, π_dist, rec.agent_params, iql_state_data, iql_obs_aidx)
+
+    return (
+        id=rec.id, sweep=rec.sweep, level=rec.level,
+        skeleton_ref=rec.skeleton_ref,
+        # Mode A:
+        A=(deg=degA, obj=objA, pol=polA),
+        # Mode B:
+        B=(deg=degB, obj=objB, pol=polB),
+    )
+end
+
+
+"""
+Run PF + metrics only, using cached buffers.
+This reruns quick_IQL (Mode B) from anon_data, but avoids regenerating the trajectories.
+"""
+function eval_ablation_from_cache(cache::Dict;
+                                  n_particles::Int=50,
+                                  ess_thresh::Float64=0.7,
+                                  refine_every::Int=5,
+                                  refine_topk::Int=5,
+                                  iql_gridN::Int=120,
+                                  gridsize::Int=120,
+                                  ess_min_frac::Float64=0.25,   # NEW
+                                  rng::AbstractRNG=Random.default_rng())
+
+    muenv_spec = cache[:muenv_spec]
+    records = cache[:records]
+
+    evals = Vector{Any}(undef, length(records))
+    ess_min = ess_min_frac * n_particles
+
+    for (i, rec) in enumerate(records)
+        mdp, agent_params = reconstruct_mdp_from_cache(rec, muenv_spec)
+
+        full_data = Dict{Symbol, Matrix}(rec[:full_data])
+        anon_data = Dict{Symbol, Matrix}(rec[:anon_data])
+
+        full_buf = ExperienceBuffer(full_data, size(full_data[:s],2), 1, Array{Int64}[], nothing, 0)
+        anon_buf = ExperienceBuffer(anon_data, size(anon_data[:s],2), 1, Array{Int64}[], nothing, 0)
+
+        π_iql, 𝒮_iql, _ = quick_IQL(mdp, anon_buf)
+
+        as = actions(mdp)
+        action_list = [as, a->Flux.onehot(a, as), Flux.onehotbatch(as, as)]
+        π_dist = ScoreΠDist(; mdp_params=action_list)
+
+        # Mode A PF inputs
+        state_dataA = full_buf.data[:s]
+        obs_aidxA   = onehot_cols_to_aidx(full_buf.data[:a])
+
+        pfA = particle_filter(obs_aidxA, π_dist, agent_params, state_dataA, n_particles;
+                              ess_thresh=ess_thresh, refine_every=refine_every, refine_topk=refine_topk)
+
+        # Mode B PF inputs
+        iql_state_data, iql_obs_aidx, _ = surrogate_dataset_from_iql_grid(π_dist, π_iql, mdp; eval_num=iql_gridN)
+
+        pfB = particle_filter(iql_obs_aidx, π_dist, agent_params, iql_state_data, n_particles;
+                              ess_thresh=ess_thresh, refine_every=refine_every, refine_topk=refine_topk)
+
+        # Degeneracy first
+        degA = pf_degeneracy(pfA, π_dist; n_particles=n_particles)
+        degB = pf_degeneracy(pfB, π_dist; n_particles=n_particles)
+
+        badA = degA.collapsed || (degA.ess < ess_min)
+        badB = degB.collapsed || (degB.ess < ess_min)
+
+        # Only compute other metrics if not degenerate; else NaN them
+        objA = badA ? (rmse_z=NaN, corr=NaN) : objective_recon_metrics(pfA, π_dist, mdp; gridsize=gridsize)
+        polA = badA ? (acc=NaN,)            : policy_match_acc(pfA, π_dist, agent_params, state_dataA, obs_aidxA)
+
+        objB = badB ? (rmse_z=NaN, corr=NaN) : objective_recon_metrics(pfB, π_dist, mdp; gridsize=gridsize)
+        polB = badB ? (acc=NaN,)             : policy_match_acc(pfB, π_dist, agent_params, iql_state_data, iql_obs_aidx)
+
+        keyA, probA = badA ? (nothing, NaN) : top_key(pfA, π_dist)
+        keyB, probB = badB ? (nothing, NaN) : top_key(pfB, π_dist)
+
+
+        evals[i] = (
+            id=rec[:id], sweep=rec[:sweep], level=rec[:level],
+            skeleton_ref=rec[:skeleton_ref],
+            A=(deg=degA, bad=badA, obj=objA, pol=polA, top_key=keyA, top_prob=probA),
+            B=(deg=degB, bad=badB, obj=objB, pol=polB, top_key=keyB, top_prob=probB),
+        )
+    end
+
+    return evals
+end
+
+############################
+# 6) Run full ablation + aggregate + plots
+############################
+
+"""
+    run_ablation_suite(bson_path; ...)
+
+End-to-end:
+1) select 25 skeletons from bins
+2) build 30 objectives
+3) synthesize 30 MDPs
+4) eval each (Mode A vs Mode B metrics)
+Returns:
+- meta info
+- eval records (vector)
+- grouped summaries
+"""
+function run_ablation_suite(bson_path::AbstractString;
+                            nbins::Int=5,
+                            per_bin::Int=5,
+                            rng=Random.default_rng(),
+                            shared_menv=build_shared_menv(),
+                            n_particles::Int=50,
+                            ess_thresh::Float64=0.7,
+                            refine_every::Int=5,
+                            refine_topk::Int=5,
+                            iql_gridN::Int=120,
+                            minN::Int=20,
+                            gridsize::Int=120)
+
+    packs_all, skeletons, bin_info = select_skeleton_mdps(bson_path; nbins=nbins, per_bin=per_bin, rng=rng)
+
+    objectives = build_ablation_objectives(; rng=rng, levels=10)
+    mdprecs = synthesize_ablation_mdps(skeletons, objectives; shared_menv=shared_menv, rng=rng)
+
+    evals = Vector{Any}(undef, length(mdprecs))
+    for (i, rec) in enumerate(mdprecs)
+        evals[i] = eval_ablation_mdp(rec;
+                                     n_particles=n_particles,
+                                     ess_thresh=ess_thresh,
+                                     refine_every=refine_every,
+                                     refine_topk=refine_topk,
+                                     iql_gridN=iql_gridN,
+                                     minN=minN,
+                                     gridsize=gridsize,
+                                     rng=rng)
+    end
+
+    return (meta=(bin_info=bin_info,
+                  n_skeletons=length(skeletons),
+                  n_objectives=length(objectives),
+                  n_mdps=length(mdprecs)),
+            evals=evals)
+end
+
+"""
+    summarize_ablation(evals)
+
+Produces per-sweep, per-level arrays for each metric comparing Mode A vs Mode B.
+Returns a Dict keyed by sweep => summary NamedTuple.
+"""
+# function summarize_ablation(evals)
+#     sweeps = unique(e.sweep for e in evals)
+#     out = Dict{Symbol,Any}()
+
+#     for sw in sweeps
+#         Es = filter(e->e.sweep==sw, evals)
+#         levels = sort(unique(e.level for e in Es))
+
+#         # helper to mean over replicates at same level (here usually 1 per level)
+#         function agg(f)
+#             [mean([f(e) for e in Es if e.level==lv]) for lv in levels]
+#         end
+
+#         # Degeneracy: use ESS + collapse flags
+#         essA = agg(e->e.A.deg.ess)
+#         essB = agg(e->e.B.deg.ess)
+#         colA = agg(e->e.A.deg.collapsed ? 1.0 : 0.0)
+#         colB = agg(e->e.B.deg.collapsed ? 1.0 : 0.0)
+
+#         # Objective recon:
+#         rmseA = agg(e->e.A.obj.rmse_z)
+#         rmseB = agg(e->e.B.obj.rmse_z)
+#         corA  = agg(e->e.A.obj.corr)
+#         corB  = agg(e->e.B.obj.corr)
+
+#         # Policy match:
+#         accA  = agg(e->e.A.pol.acc)
+#         accB  = agg(e->e.B.pol.acc)
+
+#         out[sw] = (levels=levels,
+#                    essA=essA, essB=essB,
+#                    collapsedA=colA, collapsedB=colB,
+#                    rmseA=rmseA, rmseB=rmseB,
+#                    corrA=corA, corrB=corB,
+#                    accA=accA, accB=accB)
+#     end
+
+#     return out
+# end
+
+nanmean(v) = isempty(v) ? NaN : mean(v)
+
+function summarize_ablation(evals)
+    sweeps = unique(e.sweep for e in evals)
+    out = Dict{Symbol,Any}()
+
+    for sw in sweeps
+        Es = filter(e->e.sweep==sw, evals)
+        levels = sort(unique(e.level for e in Es))
+
+        # NaN-safe aggregation over replicates at each level
+        function agg(f)
+            [begin
+                vals = [f(e) for e in Es if e.level==lv]
+                vals = filter(x -> !(ismissing(x) || (x isa Real && isnan(x))), vals)
+                nanmean(vals)
+             end for lv in levels]
+        end
+
+        # Degeneracy
+        essA = agg(e->e.A.deg.ess)
+        essB = agg(e->e.B.deg.ess)
+        colA = agg(e->e.A.deg.collapsed ? 1.0 : 0.0)
+        colB = agg(e->e.B.deg.collapsed ? 1.0 : 0.0)
+
+        badA = agg(e->e.A.bad ? 1.0 : 0.0)
+        badB = agg(e->e.B.bad ? 1.0 : 0.0)
+
+        # Objective recon
+        rmseA = agg(e->e.A.obj.rmse_z)
+        rmseB = agg(e->e.B.obj.rmse_z)
+        corA  = agg(e->e.A.obj.corr)
+        corB  = agg(e->e.B.obj.corr)
+
+        # Policy match
+        accA  = agg(e->e.A.pol.acc)
+        accB  = agg(e->e.B.pol.acc)
+
+        out[sw] = (levels=levels,
+                   essA=essA, essB=essB,
+                   collapsedA=colA, collapsedB=colB,
+                   badA=badA, badB=badB,
+                   rmseA=rmseA, rmseB=rmseB,
+                   corrA=corA, corrB=corB,
+                   accA=accA, accB=accB)
+    end
+
+    return out
+end
+
+"""
+    plot_ablation_summaries(sumdict)
+
+Creates bar plots per sweep comparing Mode A vs Mode B for:
+- ESS (degeneracy)
+- RMSE_z and Corr (objective recon)
+- policy accuracy (policy match)
+
+Returns Dict sweep => Dict(metric_name => plot)
+"""
+# function plot_ablation_summaries(sumdict::Dict{Symbol,Any})
+#     plots = Dict{Symbol,Any}()
+#     labels = [MODE_LABELS[:A] MODE_LABELS[:B]]
+
+#     for (sw, S) in sumdict
+#         lv = S.levels
+
+#         # 1) degeneracy: ESS
+#         p_ess = bar(string.(lv), [S.essA S.essB],
+#                     label=["Mode A" "Mode B"],
+#                     title="Sweep $(sw): ESS",
+#                     xlabel="sweep level", ylabel="ESS")
+
+#         # 2) objective recon: RMSE_z
+#         p_rmse = bar(string.(lv), [S.rmseA S.rmseB],
+#                      label=["Mode A" "Mode B"],
+#                      title="Sweep $(sw): objective RMSE_z",
+#                      xlabel="sweep level", ylabel="RMSE_z")
+
+#         # 3) objective recon: Corr
+#         p_corr = bar(string.(lv), [S.corrA S.corrB],
+#                      label=["Mode A" "Mode B"],
+#                      title="Sweep $(sw): objective corr",
+#                      xlabel="sweep level", ylabel="corr")
+
+#         # 4) policy match: accuracy
+#         p_acc = bar(string.(lv), [S.accA S.accB],
+#                     label=["Mode A" "Mode B"],
+#                     title="Sweep $(sw): policy match acc",
+#                     xlabel="sweep level", ylabel="accuracy")
+
+#         plots[sw] = Dict(:ess=>p_ess, :rmse=>p_rmse, :corr=>p_corr, :acc=>p_acc)
+#     end
+
+#     return plots
+# end
+
+const METHOD_LABELS = ["Open-Ended SIPS", "IQ-SIPS"]
+
+function pretty_title(sw::Symbol, metric::Symbol)
+    sweep_name = sw == :K ? "Number of Fourier Features (K)" :
+                 sw == :freq_range ? "Frequency Range" :
+                 sw == :amp_range ? "Amplitude Range" : string(sw)
+
+    metric_name = metric == :ess ? "Effective Sample Size" :
+                  metric == :rmse ? "Objective Reconstruction Error" :
+                  metric == :acc ? "Policy Match Accuracy" : string(metric)
+
+    return "$(sweep_name): $(metric_name)"
+end
+
+function pretty_xlabel(sw::Symbol)
+    sw == :K && return "K (features)"
+    sw == :freq_range && return "Frequency range (bin max index)"
+    sw == :amp_range && return "Amplitude range (bin max index)"
+    return "Sweep level"
+end
+
+function pretty_ylabel(metric::Symbol)
+    metric == :ess && return "ESS (particles)"
+    metric == :rmse && return "RMSE (objective value)"
+    metric == :acc && return "Accuracy (fraction)"
+    return string(metric)
+end
+
+function grouped_bar(levels, yA, yB; title, xlabel, ylabel, labels=METHOD_LABELS)
+    x = 1:length(levels)
+    bar(x, hcat(yA, yB);
+        bar_position=:dodge,
+        xticks=(x, string.(levels)),
+        label=labels,
+        title=title,
+        xlabel=xlabel,
+        ylabel=ylabel,
+        framestyle=:box,
+        legend=:topright)
+end
+
+function plot_ablation_summaries(sumdict::Dict{Symbol,Any})
+    # global formatting for “conference-ready”
+    default(; size=(900, 520), dpi=200, gridalpha=0.15, tickfontsize=10, guidefontsize=12, titlefontsize=14, legendfontsize=10)
+
+    plots = Dict{Symbol,Any}()
+
+    for (sw, S) in sumdict
+        lv = S.levels
+
+        p_ess = grouped_bar(lv, S.essA, S.essB;
+            title=pretty_title(sw, :ess),
+            xlabel=pretty_xlabel(sw),
+            ylabel=pretty_ylabel(:ess))
+
+        p_rmse = grouped_bar(lv, S.rmseA, S.rmseB;
+            title=pretty_title(sw, :rmse),
+            xlabel=pretty_xlabel(sw),
+            ylabel=pretty_ylabel(:rmse))
+
+        p_acc = grouped_bar(lv, S.accA, S.accB;
+            title=pretty_title(sw, :acc),
+            xlabel=pretty_xlabel(sw),
+            ylabel=pretty_ylabel(:acc))
+        ylims!(p_acc, 0, 1)
+
+        # Optional diagnostic plot to validate degeneracy filtering (not part of the 9)
+        # p_bad = grouped_bar(lv, S.badA, S.badB; title="$(pretty_xlabel(sw)): Degeneracy Rate",
+        #     xlabel=pretty_xlabel(sw), ylabel="Fraction degenerate")
+
+        plots[sw] = Dict(:ess=>p_ess, :rmse=>p_rmse, :acc=>p_acc)
+    end
+
+    return plots
+end
+
+##########################
+# Helpers: record lookup #
+##########################
+
+"""
+    cache_record_for_eval(cache, e)
+
+Find the cache record corresponding to eval entry e.
+Supports either direct index by id (1..N) or lookup by rec[:id].
+"""
+function cache_record_for_eval(cache::Dict, e)
+    records = cache[:records]
+    # fast path if ids are 1..N in order
+    if 1 ≤ e.id ≤ length(records) && haskey(records[e.id], :id) && records[e.id][:id] == e.id
+        return records[e.id]
+    end
+    # fallback lookup
+    for r in records
+        if r[:id] == e.id
+            return r
+        end
+    end
+    error("No cache record found for eval id=$(e.id)")
+end
+
+"""
+    best_eval_by_accuracy(evals; requireA=false, requireB=true)
+
+Select eval with highest IQ-SIPS accuracy subject to degeneracy constraints.
+Skips NaNs.
+"""
+function best_eval_by_accuracy(evals; requireA::Bool=false, requireB::Bool=true)
+    best = nothing
+    best_acc = -Inf
+
+    for e in evals
+        if requireB && get(e.B, :bad, false)
+            continue
+        end
+        if requireA && get(e.A, :bad, false)
+            continue
+        end
+
+        acc = get(e.B.pol, :acc, NaN)
+        if isnan(acc)
+            continue
+        end
+
+        if acc > best_acc
+            best_acc = acc
+            best = e
+        end
+    end
+
+    best === nothing && error("No eval matched constraints requireA=$requireA requireB=$requireB")
+    return best
+end
+
+#############################
+# Objective grid utilities  #
+#############################
+
+"""
+    objective_grid_from_key(key, cfg, xs, ys)
+
+Build objective scalar field from Fourier key+cfg and evaluate on grid.
+"""
+function objective_grid_from_key(key, cfg, xs, ys)
+    bank = decode_fourier_key(key, cfg)
+    field = make_fourier_scalar_field(bank; scaleQ=true)
+    return objective_grid_from_field(field, xs, ys)
+end
+
+#########################################
+# Plot 1: True objective + tracks       #
+#########################################
+
+"""
+Plot 1:
+- Heatmap of true objective
+- Overlay: observed trajectory from cache full_data[:s]
+- Overlay: rollout under IQ-SIPS top inferred objective (greedy) from same start, same horizon
+
+Returns a Plots.jl plot.
+"""
+function plot_true_objective_vs_iqsips_rollout(cache::Dict, e;
+                                               gridsize::Int=180,
+                                               xy_rows::Tuple{Int,Int}=(1,2))
+    rec = cache_record_for_eval(cache, e)
+    muenv_spec = cache[:muenv_spec]
+
+    mdp, agent_params = reconstruct_mdp_from_cache(rec, muenv_spec)
+
+    # Grid + true objective
+    xs, ys = _grid_from_mdp(mdp; gridsize=gridsize)
+    Z_true = objective_grid_from_mdp(mdp, xs, ys)
+
+    # Observed trajectory from cached data
+    Sobs = rec[:full_data][:s]
+    obs_x, obs_y = xy_path_from_state_matrix(Sobs; xy_rows=xy_rows)
+    T = length(obs_x)
+
+    # IQ-SIPS inferred rollout (requires top_key)
+    keyB = e.B.top_key
+    probB = get(e.B, :top_prob, NaN)
+
+    # Build π_dist for rollout helper
+    as = actions(mdp)
+    action_list = [as, a->Flux.onehot(a, as), Flux.onehotbatch(as, as)]
+    π_dist = ScoreΠDist(; mdp_params=action_list)
+
+    pred_x, pred_y, _ = rollout_greedy_policy(π_dist, keyB; start_state=agent_params[:start_state], T=T)
+
+    p = heatmap(xs, ys, Z_true;
+        aspect_ratio=1,
+        dpi=220,
+        title="True Objective vs IQ-SIPS Inferred Behavior (posterior ≈ $(isnan(probB) ? "?" : string(round(probB, digits=3))))",
+        xlabel="x (world units)",
+        ylabel="y (world units)",
+        colorbar_title="Objective value")
+
+    plot!(p, obs_x, obs_y; label="Observed trajectory", linewidth=3)
+    plot!(p, pred_x, pred_y; label="IQ-SIPS rollout (greedy, top key)", linewidth=3, linestyle=:dash)
+
+    scatter!(p, [obs_x[1]], [obs_y[1]]; label="Start", markersize=6)
+    scatter!(p, [obs_x[end]], [obs_y[end]]; label="End", markersize=6)
+
+    return p
+end
+
+#########################################
+# Plot 2: Objective heatmap triptych    #
+#########################################
+
+"""
+Plot 2:
+- Heatmap true objective
+- Heatmap inferred objective (Open-Ended SIPS top key)
+- Heatmap inferred objective (IQ-SIPS top key)
+
+Returns a 1x3 Plots.jl layout plot.
+"""
+function plot_objective_triptych(cache::Dict, e;
+                                 gridsize::Int=180)
+    rec = cache_record_for_eval(cache, e)
+    muenv_spec = cache[:muenv_spec]
+
+    mdp, _ = reconstruct_mdp_from_cache(rec, muenv_spec)
+
+    xs, ys = _grid_from_mdp(mdp; gridsize=gridsize)
+
+    # True objective from reconstructed mdp
+    Z_true = objective_grid_from_mdp(mdp, xs, ys)
+
+    # Inferred objectives from stored keys
+    cfg = rec[:cfg]   # FourierDiscreteCfg used to decode keys
+    keyA = e.A.top_key
+    keyB = e.B.top_key
+
+    probA = get(e.A, :top_prob, NaN)
+    probB = get(e.B, :top_prob, NaN)
+
+    Z_A = objective_grid_from_key(keyA, cfg, xs, ys)
+    Z_B = objective_grid_from_key(keyB, cfg, xs, ys)
+
+    p_true = heatmap(xs, ys, Z_true;
+        aspect_ratio=1, dpi=220,
+        title="True Objective",
+        xlabel="x (world units)", ylabel="y (world units)",
+        colorbar_title="Objective")
+
+    p_A = heatmap(xs, ys, Z_A;
+        aspect_ratio=1, dpi=220,
+        title="Open-Ended SIPS (posterior ≈ $(isnan(probA) ? "?" : string(round(probA, digits=3))))",
+        xlabel="x (world units)", ylabel="y (world units)",
+        colorbar_title="Objective")
+
+    p_B = heatmap(xs, ys, Z_B;
+        aspect_ratio=1, dpi=220,
+        title="IQ-SIPS (posterior ≈ $(isnan(probB) ? "?" : string(round(probB, digits=3))))",
+        xlabel="x (world units)", ylabel="y (world units)",
+        colorbar_title="Objective")
+
+    return plot(p_true, p_A, p_B; layout=(1,3), size=(1500, 480))
+end
+
+#########################################
+# Driver: make both figures             #
+#########################################
+
+"""
+    make_final_inference_figures(out; ...)
+
+Produces:
+1) Plot 1: best accuracy run with IQ-SIPS non-degenerate
+2) Plot 2: best accuracy run with both methods non-degenerate
+
+Returns a NamedTuple with plots and selected evals.
+"""
+function make_final_inference_figures(out;
+                                      gridsize::Int=180,
+                                      xy_rows::Tuple{Int,Int}=(1,2))
+    cache = out.cache
+    evals = out.evals
+
+    # (1) best accuracy with IQ-SIPS non-degenerate
+    e1 = best_eval_by_accuracy(evals; requireA=false, requireB=true)
+    p1 = plot_true_objective_vs_iqsips_rollout(cache, e1; gridsize=gridsize, xy_rows=xy_rows)
+
+    # (2) best accuracy with both non-degenerate
+    e2 = best_eval_by_accuracy(evals; requireA=true, requireB=true)
+    p2 = plot_objective_triptych(cache, e2; gridsize=gridsize)
+
+    return (p1=p1, p2=p2, best_iqsips=e1, best_both=e2)
+end
+
+############################################
+# Convenience single-call entrypoint
+############################################
+
+"""
+    ablation_main(bson_path; kwargs...)
+
+Runs the suite and returns:
+- raw results
+- summaries
+- plots
+"""
+# function ablation_main(bson_path::AbstractString; kwargs...)
+#     res = run_ablation_suite(bson_path; kwargs...)
+#     sums = summarize_ablation(res.evals)
+#     pls  = plot_ablation_summaries(sums)
+#     return (res=res, summaries=sums, plots=pls)
+# end
+
+"""
+ablation_main:
+- mode=:generate  -> generate buffers, save cache, then evaluate from cache
+- mode=:load      -> load cache and evaluate only
+"""
+function ablation_main(bson_path::String;
+                       script_dir::String,
+                       mode::Symbol = :generate,
+                       cache_filename::String = "ablation_cache.bson",
+                       rng::AbstractRNG = Random.default_rng(),
+                       shared_muenv_spec::MuEnvSpec = MuEnvSpec(),
+                       n_particles::Int=50,
+                       minN::Int=20,           # still used by other paths if needed
+                       iql_gridN::Int=120,
+                       gridsize::Int=120)
+
+    cache_path = joinpath(script_dir, cache_filename)
+
+    cache = if mode == :generate
+        generate_and_cache_ablation_data(bson_path;
+            cache_path=cache_path,
+            rng=rng,
+            shared_muenv_spec=shared_muenv_spec,
+            T=minN
+        )
+    elseif mode == :load
+        load_ablation_cache(cache_path)
+    else
+        error("Unknown mode=$mode (use :generate or :load)")
+    end
+
+    evals = eval_ablation_from_cache(cache;
+        n_particles=n_particles,
+        iql_gridN=iql_gridN,
+        gridsize=gridsize,
+        rng=rng
+    )
+
+    sums = summarize_ablation(evals)
+    pls  = plot_ablation_summaries(sums)
+    return (cache_path=cache_path, cache=cache, evals=evals, summaries=sums, plots=pls)
+end
 
 #################
 ### Scripting ###
@@ -1626,6 +2967,13 @@ function onehot_cols_to_aidx(A::AbstractMatrix; tol::Real=1e-8)
     return aidx
 end
 
+menv = let μfs = [(:sin, x->sin(x[1]) + cos(x[2])),
+                  (:exp, x->100*exp(-norm(x-[8 8.])^2 / 1.)),
+                  (:lin, x->x[1]^2 + x[2])],
+                  μs = [:sin, :exp, :lin];
+    MuEnv(3, μs, Dict(μfs));
+end
+
 """
     agent_params_from_mdp(mdp::KAgentPOMDP) -> Dict{Symbol,Any}
 
@@ -1639,9 +2987,9 @@ function agent_params_from_mdp(mdp::KAgentPOMDP)
     return Dict(
         # --- required ---
         :start        => mdp.start,
-        :start_state  => rand(initialstate(mdp)),
+        :start_state  => KAgentState(mdp.start, [predict_env(menv, mdp.start)], Matrix[]),
         :dimensions   => mdp.dimensions,
-        :menv         => mdp.menv,
+        :menv         => menv,
 
         # --- dynamics / noise ---
         :agent_width  => mdp.width,
@@ -1664,29 +3012,56 @@ println("Directory is: ", @__DIR__)
 
 script_dir = @__DIR__
 
-(kworld, data, anon_data) = BSON.load(script_dir*"/single_start_exp.bson")[:data]
-data = data_cleaner(data, [2,2,12,10,1], Bool[1,1,1,0,1])
-anon_data = data_cleaner(anon_data, [2,2,12,10,1], Bool[1,1,1,0,1])
+bson_path = script_dir*"/100_15_100_7_multi_trace_run.bson"
 
-π_iql, 𝒟_iql, mdp, f = quick_IQL(kworld, anon_data; plot_metrics=false)
-action_list = [actions(mdp), a->Flux.onehot(a, actions(mdp)), Flux.onehotbatch(actions(mdp), actions(mdp))]
+rng = MersenneTwister(0)
 
-π_dist = ScoreΠDist(; mdp_params = action_list)
+out = ablation_main(bson_path;
+    script_dir=script_dir,
+    mode=:load, # or :load
+    rng=rng,
+    shared_muenv_spec=MuEnvSpec(),
+    n_particles=50,
+    minN=20,
+    iql_gridN=120,
+    gridsize=120
+)
 
-# relevant_data = anon_data.data[:a][:,1:12]
-relevant_data = onehot_cols_to_aidx(anon_data.data[:a][:,1:12])
-start_state = blindstart_KAgentState(mdp, reshape(data.data[:s][:,1][1:2], (1,2)))
-agent_params = agent_params_from_mdp(mdp)
-state_data = data.data[:s][:,1:12]
+# Example: show plots
+display(out.plots[:K][:ess])
+display(out.plots[:freq_range][:rmse])
+display(out.plots[:amp_range][:acc])
 
-iql_state_data, iql_obs_aidx, iql_locs = surrogate_dataset_from_iql_grid(π_dist, π_iql, mdp; eval_num=400)
+figs = make_final_inference_figures(out; gridsize=200)
+display(figs.p1); display(figs.p2)
+savefig(figs.p1, joinpath(script_dir, "final_true_vs_iqsips_rollout.png"))
+savefig(figs.p2, joinpath(script_dir, "final_objective_triptych.png"))
 
-filter_state = particle_filter(relevant_data, π_dist, agent_params, state_data, 80; ess_thresh=0.7)
+# res = multi_run_test(script_dir*"/100_15_100_7_multi_trace_run.bson"; max_tests=200)
 
-tops = top_objectives(filter_state, π_dist; topk=10)
-# top objective evaluation
-p_traj = plot_top_objective_with_trajectories(filter_state, π_dist, agent_params;
-                                              observed_state_matrix=state_data, xy_rows=(1,2),
-                                              gridsize=160, show_predicted=true, title_prefix="Top inferred objective")
-# compare top objective against the true objective map
-p_side = plot_objective_side_by_side(filter_state, π_dist; observed_mdp=mdp, gridsize=160)
+# (kworld, data, anon_data) = BSON.load(script_dir*"/single_start_exp.bson")[:data]
+# data = data_cleaner(data, [2,2,12,10,1], Bool[1,1,1,0,1])
+# anon_data = data_cleaner(anon_data, [2,2,12,10,1], Bool[1,1,1,0,1])
+
+# π_iql, 𝒟_iql, mdp, f = quick_IQL(kworld, anon_data; plot_metrics=false)
+# action_list = [actions(mdp), a->Flux.onehot(a, actions(mdp)), Flux.onehotbatch(actions(mdp), actions(mdp))]
+
+# π_dist = ScoreΠDist(; mdp_params = action_list)
+
+# # relevant_data = anon_data.data[:a][:,1:12]
+# relevant_data = onehot_cols_to_aidx(anon_data.data[:a][:,1:12])
+# start_state = blindstart_KAgentState(mdp, reshape(data.data[:s][:,1][1:2], (1,2)))
+# agent_params = agent_params_from_mdp(mdp)
+# state_data = data.data[:s][:,1:12]
+
+# iql_state_data, iql_obs_aidx, iql_locs = surrogate_dataset_from_iql_grid(π_dist, π_iql, mdp; eval_num=400)
+
+# filter_state = particle_filter(relevant_data, π_dist, agent_params, state_data, 80; ess_thresh=0.7)
+
+# tops = top_objectives(filter_state, π_dist; topk=10)
+# # top objective evaluation
+# p_traj = plot_top_objective_with_trajectories(filter_state, π_dist, agent_params;
+#                                               observed_state_matrix=state_data, xy_rows=(1,2),
+#                                               gridsize=160, show_predicted=true, title_prefix="Top inferred objective")
+# # compare top objective against the true objective map
+# p_side = plot_objective_side_by_side(filter_state, π_dist; observed_mdp=mdp, gridsize=160)

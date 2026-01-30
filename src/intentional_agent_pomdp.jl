@@ -1,4 +1,4 @@
-export KAgentPOMDP, init_standard_KAgentPOMDP, KAgentBeliefUpdater
+export KAgentPOMDP, init_standard_KAgentPOMDP, KAgentBeliefUpdater, shape_state_as_obs
 
 @with_kw_noshow struct KAgentPOMDP <: POMDPs.POMDP{KAgentState, Symbol, Vector{Float64}}
     name::String
