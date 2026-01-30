@@ -11,6 +11,7 @@ import GeoInterface as GI
 
 # addressing weird load order bugs
 using Plots
+using Measures
 using CUDA, cuDNN
 
 # Commenting out CairoMakie due to current issue compiling with Plots and GR_jll
@@ -2565,23 +2566,58 @@ Returns Dict sweep => Dict(metric_name => plot)
 
 const METHOD_LABELS = ["Open-Ended SIPS", "IQ-SIPS"]
 
-function pretty_title(sw::Symbol, metric::Symbol)
-    sweep_name = sw == :K ? "Number of Fourier Features (K)" :
-                 sw == :freq_range ? "Frequency Range" :
-                 sw == :amp_range ? "Amplitude Range" : string(sw)
+# Convert sweep levels (stored as bin max indices) to interpretable labels in physical units.
+# Uses the cfg stored in cache per-record (best, because it reflects the actual sweep).
+function sweep_tick_labels_from_cache(cache::Dict, sw::Symbol, levels::Vector{Int})
+    recs = cache[:records]
 
-    metric_name = metric == :ess ? "Effective Sample Size" :
-                  metric == :rmse ? "Objective Reconstruction Error" :
-                  metric == :acc ? "Policy Match Accuracy" : string(metric)
+    # Helper: find cfg for a (sweep, level)
+    function cfg_for(sw, lv)
+        for r in recs
+            if r[:sweep] == sw && r[:level] == lv
+                return r[:cfg]
+            end
+        end
+        error("No cache record found for sweep=$(sw), level=$(lv)")
+    end
 
-    return "$(sweep_name): $(metric_name)"
+    labels = String[]
+    for lv in levels
+        cfg = cfg_for(sw, lv)
+        if sw == :K
+            push!(labels, string(lv))  # K itself is meaningful
+        elseif sw == :freq_range
+            # lv is Fmax_i; Δf is physical step
+            halfspan = lv * cfg.Δf
+            width = 2 * halfspan
+            push!(labels, @sprintf("%.2f", width))  # show width, not index
+            # alternatively: push!(labels, "±$(round(halfspan,digits=2))")
+        elseif sw == :amp_range
+            # lv is Amax_i; ΔA is physical step
+            amax = lv * cfg.ΔA
+            push!(labels, @sprintf("%.2f", amax))
+        else
+            push!(labels, string(lv))
+        end
+    end
+    return labels
 end
 
 function pretty_xlabel(sw::Symbol)
-    sw == :K && return "K (features)"
-    sw == :freq_range && return "Frequency range (bin max index)"
-    sw == :amp_range && return "Amplitude range (bin max index)"
+    sw == :K && return "K (number of Fourier features)"
+    sw == :freq_range && return "Frequency range width, 2Fₘₐₓ (units)"
+    sw == :amp_range && return "Amplitude maximum, Aₘₐₓ (units)"
     return "Sweep level"
+end
+
+function pretty_title(sw::Symbol, metric::Symbol)
+    sweep_name = sw == :K ? "K Sweep" :
+                 sw == :freq_range ? "Frequency Range Sweep" :
+                 sw == :amp_range ? "Amplitude Range Sweep" : string(sw)
+    metric_name = metric == :ess ? "Effective Sample Size (ESS)" :
+                  metric == :rmse ? "Objective Reconstruction Error (RMSE)" :
+                  metric == :acc ? "Policy Match Accuracy" : string(metric)
+    return "$(sweep_name): $(metric_name)"
 end
 
 function pretty_ylabel(metric::Symbol)
@@ -2591,47 +2627,77 @@ function pretty_ylabel(metric::Symbol)
     return string(metric)
 end
 
-function grouped_bar(levels, yA, yB; title, xlabel, ylabel, labels=METHOD_LABELS)
-    x = 1:length(levels)
-    bar(x, hcat(yA, yB);
+# Core grouped-bar helper (this is the key fix).
+# Use numeric x positions + dodge + explicit xticks.
+function grouped_bars(level_labels::Vector{String}, yA::Vector, yB::Vector;
+                      title::String, xlabel::String, ylabel::String;
+                      ylims=nothing)
+
+    n = length(level_labels)
+    @assert length(yA) == n && length(yB) == n
+
+    x = 1:n
+    Y = hcat(yA, yB)  # N×2 -> two series at each x (grouped)
+
+    p = bar(x, Y;
         bar_position=:dodge,
-        xticks=(x, string.(levels)),
-        label=labels,
+        legend=:topright,
+        label=METHOD_LABELS,
+        xticks=(x, level_labels),
+        xrotation=25,
         title=title,
         xlabel=xlabel,
         ylabel=ylabel,
+        size=(950, 560),
+        dpi=220,
         framestyle=:box,
-        legend=:topright)
+        gridalpha=0.15,
+        left_margin=12mm, right_margin=6mm,
+        top_margin=10mm, bottom_margin=12mm
+    )
+
+    if ylims !== nothing
+        ylims!(p, ylims)
+    end
+
+    return p
 end
 
-function plot_ablation_summaries(sumdict::Dict{Symbol,Any})
-    # global formatting for “conference-ready”
-    default(; size=(900, 520), dpi=200, gridalpha=0.15, tickfontsize=10, guidefontsize=12, titlefontsize=14, legendfontsize=10)
+"""
+    make_ablation_barplots(out)
 
-    plots = Dict{Symbol,Any}()
+Given `out = ablation_main(...)`, returns Dict[sweep][metric] => plot,
+with 9 plots total (3 sweeps × 3 metrics).
+"""
+function make_ablation_barplots(out)
+    sumdict = out.summaries
+    cache = out.cache
+
+    plots = Dict{Symbol,Dict{Symbol,Any}}()
 
     for (sw, S) in sumdict
-        lv = S.levels
+        levels = S.levels
+        tick_labels = sweep_tick_labels_from_cache(cache, sw, levels)
 
-        p_ess = grouped_bar(lv, S.essA, S.essB;
+        p_ess = grouped_bars(tick_labels, S.essA, S.essB;
             title=pretty_title(sw, :ess),
             xlabel=pretty_xlabel(sw),
-            ylabel=pretty_ylabel(:ess))
+            ylabel=pretty_ylabel(:ess),
+            ylims=(0, out.meta[:n_particles])  # assumes you return this meta; see ablation_main patch below
+        )
 
-        p_rmse = grouped_bar(lv, S.rmseA, S.rmseB;
+        p_rmse = grouped_bars(tick_labels, S.rmseA, S.rmseB;
             title=pretty_title(sw, :rmse),
             xlabel=pretty_xlabel(sw),
-            ylabel=pretty_ylabel(:rmse))
+            ylabel=pretty_ylabel(:rmse)
+        )
 
-        p_acc = grouped_bar(lv, S.accA, S.accB;
+        p_acc = grouped_bars(tick_labels, S.accA, S.accB;
             title=pretty_title(sw, :acc),
             xlabel=pretty_xlabel(sw),
-            ylabel=pretty_ylabel(:acc))
-        ylims!(p_acc, 0, 1)
-
-        # Optional diagnostic plot to validate degeneracy filtering (not part of the 9)
-        # p_bad = grouped_bar(lv, S.badA, S.badB; title="$(pretty_xlabel(sw)): Degeneracy Rate",
-        #     xlabel=pretty_xlabel(sw), ylabel="Fraction degenerate")
+            ylabel=pretty_ylabel(:acc),
+            ylims=(0, 1)
+        )
 
         plots[sw] = Dict(:ess=>p_ess, :rmse=>p_rmse, :acc=>p_acc)
     end
@@ -2913,8 +2979,18 @@ function ablation_main(bson_path::String;
     )
 
     sums = summarize_ablation(evals)
-    pls  = plot_ablation_summaries(sums)
-    return (cache_path=cache_path, cache=cache, evals=evals, summaries=sums, plots=pls)
+
+    out = (
+        cache_path = cache_path,
+        cache = cache,
+        evals = evals,
+        summaries = sums,
+        meta = Dict(:n_particles => n_particles, :iql_gridN => iql_gridN, :gridsize => gridsize)
+    )
+    # Save the entire out wholesale
+    BSON.@save joinpath(script_dir, "ablation_out_wholesale.bson") out
+
+    return out
 end
 
 #################
@@ -3018,19 +3094,34 @@ rng = MersenneTwister(0)
 
 out = ablation_main(bson_path;
     script_dir=script_dir,
-    mode=:load, # or :load
+    mode=:load,   # or :generate
     rng=rng,
-    shared_muenv_spec=MuEnvSpec(),
     n_particles=50,
-    minN=20,
-    iql_gridN=120,
+    minN=100,
+    iql_gridN=100,
     gridsize=120
 )
 
+# d = BSON.load(joinpath(script_dir, "ablation_out_wholesale.bson"))
+# out = d[:out]
+plots = make_ablation_barplots(out)
+
 # Example: show plots
-display(out.plots[:K][:ess])
-display(out.plots[:freq_range][:rmse])
-display(out.plots[:amp_range][:acc])
+display(plots[:K][:acc])
+display(plots[:K][:ess])
+display(plots[:K][:rmse])
+display(plots[:freq_range][:acc])
+display(plots[:freq_range][:ess])
+display(plots[:freq_range][:rmse])
+display(plots[:amp_range][:acc])
+display(plots[:amp_range][:ess])
+display(plots[:amp_range][:rmse])
+
+for (sw, pd) in plots
+    for (metric, p) in pd
+        savefig(p, joinpath(script_dir, "$(sw)_$(metric).png"))
+    end
+end
 
 figs = make_final_inference_figures(out; gridsize=200)
 display(figs.p1); display(figs.p2)
