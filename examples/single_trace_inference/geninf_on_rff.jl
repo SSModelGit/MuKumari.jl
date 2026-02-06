@@ -7,10 +7,12 @@ using Combinatorics: powerset
 using POMDPTools, MCTS, POMDPLinter
 using Match: @match
 using Parameters: @with_kw
+using Printf
 import GeoInterface as GI
 
 # addressing weird load order bugs
 using Plots
+using StatsPlots
 using Measures
 using CUDA, cuDNN
 
@@ -139,16 +141,16 @@ end
 #################################
 
 @with_kw struct FourierDiscreteCfg
-    Kmax::Int = 24
+    Kmax::Int = 10
     λK::Float64 = 0.35            # P(K=k) ∝ exp(-λK*(k-1))
 
     # frequency grid
     Δf::Float64 = 0.1
-    Fmax_i::Int = 30              # bins in -Fmax_i:Fmax_i
+    Fmax_i::Int = 10              # bins in -Fmax_i:Fmax_i
 
     # amplitude grid
     ΔA::Float64 = 0.1
-    Amax_i::Int = 50              # bins in 0:Amax_i
+    Amax_i::Int = 1              # bins in 0:Amax_i
 
     # phase grid
     P::Int = 32                   # bins in 0:P-1
@@ -603,7 +605,7 @@ end
 Base.copy(s::KAgentState) = KAgentState(copy(s.x), copy(s.z), copy(s.hist))
 
 """
-Decode your Fourier key of the form (K, fx_i, fy_i, A_i, ϕ_i) into continuous params.
+Decode Fourier key of the form (K, fx_i, fy_i, A_i, ϕ_i) into continuous params.
 Assumes fx_i etc are integer vectors of length K (or length Kmax, if fixed-bank).
 """
 function decode_fourier_key(key, cfg::FourierDiscreteCfg)
@@ -1004,8 +1006,7 @@ end
 """
     _dims_to_bounds(dimensions) -> (lo, hi)
 
-Your code treats `dimensions` as a 2-tuple (d1, d2) and constructs the boxworld
-with corners (d1,d1) and (d2,d2). This helper just standardizes that.
+Standardizes boxworld construction from 2-tuple `dimensions` with corners (d1,d1) and (d2,d2).
 """
 @inline function _dims_to_bounds(dimensions)
     lo, hi = dimensions[1], dimensions[2]
@@ -1029,7 +1030,6 @@ end
     _state_at_xy(mdp, x, y) -> KAgentState
 
 Constructs a state located at (x,y) using MuKumari's blindstart helper.
-This matches your usage pattern at the bottom of the file.
 """
 @inline function _state_at_xy(mdp::KAgentPOMDP, x::Real, y::Real)
     return blindstart_KAgentState(mdp, reshape([Float64(x), Float64(y)], (1,2)))
@@ -1071,8 +1071,7 @@ end
 """
     xy_path_from_state_matrix(S; xy_rows=(1,2)) -> (xs, ys)
 
-Your cleaned data uses `data.data[:s]` with x,y in the first two rows
-(after your data_cleaner trimming). This helper extracts the trajectory.
+Extracts the trajectory from `data::ExperienceBufer`
 
 - S is (n_features × T)
 - returns vectors length T
@@ -1092,7 +1091,7 @@ end
 """
     greedy_action_symbol_from_boltzmann(π_dist, key, s) -> (a_sym, a_idx)
 
-Uses your existing proposal_boltzmann(...) machinery to compute a Boltzmann
+Uses `proposal_boltzmann(...)` machinery to compute a Boltzmann
 distribution over actions and then selects argmax (greedy).
 
 This gives a deterministic rollout for visual comparison.
@@ -1386,12 +1385,10 @@ function eval_pack(pack::RunPack;
 
     mdp = pack.mdp
 
-    # 1) train IQL on anon buffer (your quick_IQL expects kworld in some scripts;
-    #    if your version accepts only anon_data, swap accordingly)
+    # 1) train IQL on anon buffer
     # In geninf_on_rff.jl, quick_IQL(kworld, anon_data) trains using mdp=get_agent(kworld,"ag1").
-    # For per-instance mdp training, prefer your per-mdp IQL helper if you have it.
     # Here we use a minimal per-mdp pattern (works if OnlineIQLearn etc already imported):
-    π_iql, 𝒟_iql, _, _ = quick_IQL(mdp, pack.anon)  # <- if this is not valid in your env, replace with your per-mdp IQL trainer
+    π_iql, 𝒟_iql, _, _ = quick_IQL(mdp, pack.anon)
 
     # 2) build π_dist action mappings from this mdp’s action set
     as = actions(mdp)
@@ -1787,11 +1784,6 @@ end
 
 """
     rollout_experience_buffer(mdp, π; T=20, temperature=1.0, rng=...)
-
-Generates the exact ExperienceBuffer requested:
-- state vectors are observation-vector format (via MuKumari.shape_state_as_obs)
-- done flags are all false (per your spec)
-- timestamps 1..T
 """
 function rollout_experience_buffer(mdp::KAgentPOMDP, π;
                                    T::Int=20,
@@ -1828,9 +1820,6 @@ function rollout_experience_buffer(mdp::KAgentPOMDP, π;
         # store reward (1×T)
         data[:r][1, t] = Float64(r)
 
-        # timestamps already filled; done must remain all false per your spec
-        # data[:done][1, t] = false  # redundant; already false
-
         s = sp
     end
 
@@ -1839,9 +1828,6 @@ end
 
 """
     build_shared_menv(; M=3)
-
-Your requirement: all test MDPs share the same MuEnv.
-You can replace μfs with whatever you want; this is a stable default.
 """
 function build_shared_menv(; M::Int=3)
     μfs = [
@@ -1967,10 +1953,10 @@ function build_ablation_objectives(; rng=Random.default_rng(),
 
     # Sweep A: number of features K (keep freq/amp “similar”: small ranges)
     # Choose narrow supports by using small Fmax_i and small Amax_i.
-    cfgK = FourierDiscreteCfg(; Kmax=24,
+    cfgK = FourierDiscreteCfg(; Kmax=10,
                              λK=base_cfg.λK,
                              Δf=base_cfg.Δf, Fmax_i=3, freq_mag_decay=0.0,
-                             ΔA=base_cfg.ΔA, Amax_i=6,
+                             ΔA=base_cfg.ΔA, Amax_i=1,
                              P=base_cfg.P)
 
     for i in 1:levels
@@ -1985,7 +1971,7 @@ function build_ablation_objectives(; rng=Random.default_rng(),
 
     # Sweep B: frequency range (keep K=2, amplitude range fixed)
     # “Similar freq values” -> small Fmax_i; “very different” -> large Fmax_i.
-    cfgF_base = FourierDiscreteCfg(; Kmax=24,
+    cfgF_base = FourierDiscreteCfg(; Kmax=10,
                                   λK=base_cfg.λK,
                                   Δf=base_cfg.Δf,
                                   Fmax_i=3, freq_mag_decay=0.0,
@@ -2006,7 +1992,7 @@ function build_ablation_objectives(; rng=Random.default_rng(),
     end
 
     # Sweep C: amplitude range (keep K=2, frequency range fixed)
-    cfgA_base = FourierDiscreteCfg(; Kmax=24,
+    cfgA_base = FourierDiscreteCfg(; Kmax=10,
                                   λK=base_cfg.λK,
                                   Δf=base_cfg.Δf, Fmax_i=base_cfg.Fmax_i, freq_mag_decay=base_cfg.freq_mag_decay,
                                   ΔA=base_cfg.ΔA, Amax_i=3,
@@ -2054,7 +2040,6 @@ function synthesize_ablation_mdps(skeleton_packs::Vector{RunPack},
         sk = rand(rng, skeleton_packs)
         agent_params = agent_params_from_mdp(sk.mdp)
 
-        # override as requested
         agent_params[:menv]  = shared_menv
         agent_params[:goals] = Any[]
 
@@ -2078,7 +2063,7 @@ end
 """
     softq_policy(mdp; N=2000, epochs=2, batch_size=256)
 
-Trains SoftQ via your existing deep_q_solver and returns (solver, policy).
+Trains SoftQ via deep_q_solver and returns (solver, policy).
 """
 function softq_policy(mdp::KAgentPOMDP; N::Int=2000, epochs::Int=2, batch_size::Int=256)
     𝒮 = deep_q_solver(mdp; solver_params=[:softq, N, epochs, batch_size])
@@ -2091,7 +2076,7 @@ end
 ###########################
 
 @with_kw struct MuEnvSpec
-    variant::Symbol = :default_shared   # lets you branch later
+    variant::Symbol = :default_shared
     M::Int = 3
     μ_order::Vector{Symbol} = [:sin, :exp, :lin]
 end
@@ -2155,8 +2140,7 @@ function generate_and_cache_ablation_data(bson_path::String;
 
     objectives = build_ablation_objectives(; rng=rng, levels=levels)
 
-    # IMPORTANT: do NOT call agent_params_from_mdp in a way that touches BSON-loaded mdp.menv.
-    # You already fixed that earlier by building start_state from global/shared menv.
+    # IMPORTANT: do NOT call agent_params_from_mdp in a way that touches BSON-loaded mdp.menv
     mdprecs = synthesize_ablation_mdps(skeletons, objectives;
                                        shared_menv=build_shared_menv(shared_muenv_spec),
                                        rng=rng)
@@ -2238,7 +2222,7 @@ function eval_ablation_mdp(rec; n_particles::Int=50, ess_thresh::Float64=0.7, re
     # 1) Train SoftQ for data generation (Mode A “real” dataset)
     _, π_softq = softq_policy(mdp; N=2000, epochs=2, batch_size=256)
 
-    # 2) Generate experience (full + anon identical here unless you want otherwise)
+    # 2) Generate experience (full + anon identical here)
     temperature = get(rec.agent_params, :policy_temperature, 2.0)
     full_buf = rollout_experience_buffer(mdp, π_softq; T=minN, temperature=temperature, rng=rng)
 
@@ -2247,7 +2231,7 @@ function eval_ablation_mdp(rec; n_particles::Int=50, ess_thresh::Float64=0.7, re
     anonymize_buffer_location!(anon_buf)
 
     # 3) Train IQL (Mode B surrogate driver)
-    π_iql, 𝒟_iql, _ = quick_IQL(mdp, anon_buf)  # uses your existing helper
+    π_iql, 𝒟_iql, _ = quick_IQL(mdp, anon_buf)  # uses helper
 
     # 4) Build π_dist with action mappings
     as = actions(mdp)
@@ -2327,14 +2311,15 @@ function eval_ablation_from_cache(cache::Dict;
         # Mode A PF inputs
         state_dataA = full_buf.data[:s]
         obs_aidxA   = onehot_cols_to_aidx(full_buf.data[:a])
+        lobs = Int64(length(obs_aidxA) * 0.1)
 
-        pfA = particle_filter(obs_aidxA, π_dist, agent_params, state_dataA, n_particles;
+        pfA = particle_filter(obs_aidxA[1:lobs], π_dist, agent_params, state_dataA[:, 1:lobs], n_particles;
                               ess_thresh=ess_thresh, refine_every=refine_every, refine_topk=refine_topk)
 
-        # Mode B PF inputs
-        iql_state_data, iql_obs_aidx, _ = surrogate_dataset_from_iql_grid(π_dist, π_iql, mdp; eval_num=iql_gridN)
+        # Mode B PF inputs: TODO!!!
+        # iql_state_data, iql_obs_aidx, _ = surrogate_dataset_from_iql_grid(π_dist, π_iql, mdp; eval_num=iql_gridN)
 
-        pfB = particle_filter(iql_obs_aidx, π_dist, agent_params, iql_state_data, n_particles;
+        pfB = particle_filter(obs_aidxA, π_dist, agent_params, state_dataA, n_particles*3;
                               ess_thresh=ess_thresh, refine_every=refine_every, refine_topk=refine_topk)
 
         # Degeneracy first
@@ -2349,7 +2334,7 @@ function eval_ablation_from_cache(cache::Dict;
         polA = badA ? (acc=NaN,)            : policy_match_acc(pfA, π_dist, agent_params, state_dataA, obs_aidxA)
 
         objB = badB ? (rmse_z=NaN, corr=NaN) : objective_recon_metrics(pfB, π_dist, mdp; gridsize=gridsize)
-        polB = badB ? (acc=NaN,)             : policy_match_acc(pfB, π_dist, agent_params, iql_state_data, iql_obs_aidx)
+        polB = badB ? (acc=NaN,)             : policy_match_acc(pfB, π_dist, agent_params, state_dataA, obs_aidxA)
 
         keyA, probA = badA ? (nothing, NaN) : top_key(pfA, π_dist)
         keyB, probB = badB ? (nothing, NaN) : top_key(pfB, π_dist)
@@ -2566,6 +2551,121 @@ Returns Dict sweep => Dict(metric_name => plot)
 
 const METHOD_LABELS = ["Open-Ended SIPS", "IQ-SIPS"]
 
+degmask_from_summary(metricA::Vector, metricB::Vector, colA::Vector, colB::Vector) = (
+    ((colA .>= 0.5) .| isnan.(Float64.(metricA))),   # degenerate A
+    ((colB .>= 0.5) .| isnan.(Float64.(metricB)))    # degenerate B
+)
+replace_nan_with_zero(v::Vector) = [isnan(Float64(x)) ? 0.0 : Float64(x) for x in v]
+
+# Pick a small nonzero height that scales with the plot.
+function default_deg_height(yA_plot::Vector{<:Real}, yB_plot::Vector{<:Real}; ylims=nothing)
+    # Prefer ylims if provided (best for ACC/ESS)
+    if ylims !== nothing
+        ymin, ymax = ylims
+        yr = max(ymax - ymin, eps(Float64))
+        return 0.03 * yr
+    end
+
+    # Otherwise infer from data scale (RMSE often)
+    ys = vcat(yA_plot, yB_plot)
+    ymax = maximum(ys)
+    if !isfinite(ymax) || ymax ≤ 0
+        return 0.05
+    end
+    return max(0.03 * ymax, 1e-6)
+end
+
+# Draw diagonal hatch lines over a rectangular bar region.
+# This works on any Plots backend.
+function hatch_rect!(p, x_left::Real, x_right::Real, y0::Real, y1::Real;
+                     spacing_frac::Real=0.18, linecolor=:black, linewidth::Real=1.5, direction::Symbol=:/)
+    w = x_right - x_left
+    h = y1 - y0
+    if w ≤ 0 || h ≤ 0
+        return p
+    end
+
+    spacing = spacing_frac * w
+    # We draw a family of parallel lines that intersect the rectangle.
+    # direction = :/ means rising left->right, :\ means falling left->right.
+    if direction == :/
+        # Lines: y = (h/w)*(x - c) + y0; sweep c
+        cmin = x_left - h * (w/h)  # safe over-sweep
+        cmax = x_right
+        cs = collect(cmin:spacing:cmax)
+        for c in cs
+            # segment endpoints clipped to rectangle
+            # compute intersection with bottom/top edges
+            x0 = c
+            y_at_xleft  = y0 + (h/w) * (x_left - c)
+            y_at_xright = y0 + (h/w) * (x_right - c)
+
+            # candidate points on left/right edges
+            pts = Tuple{Float64,Float64}[]
+            if y0 ≤ y_at_xleft ≤ y1
+                push!(pts, (x_left, y_at_xleft))
+            end
+            if y0 ≤ y_at_xright ≤ y1
+                push!(pts, (x_right, y_at_xright))
+            end
+            # intersections with bottom/top edges
+            x_at_y0 = c
+            x_at_y1 = c + (w/h)*h  # c + w
+            # Actually for this parameterization, easier: solve for x given y:
+            # y = y0 + (h/w)(x - c) => x = c + (w/h)(y - y0)
+            x_bot = c + (w/h)*(0.0)
+            x_top = c + (w/h)*(h)
+            if x_left ≤ x_bot ≤ x_right
+                push!(pts, (x_bot, y0))
+            end
+            if x_left ≤ x_top ≤ x_right
+                push!(pts, (x_top, y1))
+            end
+
+            if length(pts) ≥ 2
+                # pick two farthest points (simple: first two after unique)
+                (xA,yA),(xB,yB) = pts[1], pts[2]
+                plot!(p, [xA,xB], [yA,yB]; color=linecolor, linewidth=linewidth, label=nothing)
+            end
+        end
+    else
+        # direction == :\ : mirror by swapping left/right in the slope sign
+        # Use same approach but slope negative.
+        spacing = spacing_frac * w
+        cs = collect((x_left):spacing:(x_right + h*(w/h)))
+        for c in cs
+            # line: y = y0 + (h/w)*(c - x)
+            y_at_xleft  = y0 + (h/w) * (c - x_left)
+            y_at_xright = y0 + (h/w) * (c - x_right)
+
+            pts = Tuple{Float64,Float64}[]
+            if y0 ≤ y_at_xleft ≤ y1
+                push!(pts, (x_left, y_at_xleft))
+            end
+            if y0 ≤ y_at_xright ≤ y1
+                push!(pts, (x_right, y_at_xright))
+            end
+
+            # Solve for x on bottom/top: y = y0 + (h/w)*(c - x) => x = c - (w/h)(y - y0)
+            x_bot = c - (w/h)*(0.0)
+            x_top = c - (w/h)*(h)
+            if x_left ≤ x_bot ≤ x_right
+                push!(pts, (x_bot, y0))
+            end
+            if x_left ≤ x_top ≤ x_right
+                push!(pts, (x_top, y1))
+            end
+
+            if length(pts) ≥ 2
+                (xA,yA),(xB,yB) = pts[1], pts[2]
+                plot!(p, [xA,xB], [yA,yB]; color=linecolor, linewidth=linewidth, label=nothing)
+            end
+        end
+    end
+
+    return p
+end
+
 # Convert sweep levels (stored as bin max indices) to interpretable labels in physical units.
 # Uses the cfg stored in cache per-record (best, because it reflects the actual sweep).
 function sweep_tick_labels_from_cache(cache::Dict, sw::Symbol, levels::Vector{Int})
@@ -2629,19 +2729,98 @@ end
 
 # Core grouped-bar helper (this is the key fix).
 # Use numeric x positions + dodge + explicit xticks.
+# function grouped_bars(level_labels::Vector{String}, yA::Vector, yB::Vector;
+#                       title::String, xlabel::String, ylabel::String,
+#                       ylims=nothing)
+
+#     n = length(level_labels)
+#     @assert length(yA) == n && length(yB) == n
+
+#     x = 1:n
+#     Y = hcat(yA, yB)  # N×2 -> two series at each x (grouped)
+
+#     p = bar(x, Y;
+#         bar_position=:dodge,
+#         legend=:topright,
+#         label=METHOD_LABELS,
+#         xticks=(x, level_labels),
+#         xrotation=25,
+#         title=title,
+#         xlabel=xlabel,
+#         ylabel=ylabel,
+#         size=(950, 560),
+#         dpi=220,
+#         framestyle=:box,
+#         gridalpha=0.15,
+#         left_margin=12mm, right_margin=6mm,
+#         top_margin=10mm, bottom_margin=12mm
+#     )
+
+#     if ylims !== nothing
+#         ylims!(p, ylims)
+#     end
+
+#     return p
+# end
+
 function grouped_bars(level_labels::Vector{String}, yA::Vector, yB::Vector;
-                      title::String, xlabel::String, ylabel::String;
+                      title::String, xlabel::String, ylabel::String,
                       ylims=nothing)
 
     n = length(level_labels)
     @assert length(yA) == n && length(yB) == n
 
+    # IMPORTANT: numeric x; labels supplied via xticks
     x = 1:n
-    Y = hcat(yA, yB)  # N×2 -> two series at each x (grouped)
 
-    p = bar(x, Y;
+    # Y must be n×2 where each column is a method (A, B)
+    Y = hcat(yA, yB)
+
+    p = groupedbar(
+        x, Y;
+        bar_position = :dodge,      # side-by-side
+        label = METHOD_LABELS,
+        xticks = (x, level_labels),
+        xrotation = 25,
+        title = title,
+        xlabel = xlabel,
+        ylabel = ylabel,
+        size = (950, 560),
+        dpi = 220,
+        framestyle = :box,
+        gridalpha = 0.15,
+        legend = :topright,
+        left_margin = 12mm, right_margin = 6mm,
+        top_margin = 10mm, bottom_margin = 12mm
+    )
+
+    if ylims !== nothing
+        ylims!(p, ylims)
+    end
+
+    return p
+end
+
+function grouped_bars_with_degenerate_overlay(
+    level_labels::Vector{String},
+    yA::Vector, yB::Vector,
+    degA::AbstractVector{Bool}, degB::AbstractVector{Bool};
+    title::String, xlabel::String, ylabel::String,
+    ylims=nothing,
+    deg_height::Union{Nothing,Float64}=nothing
+)
+    n = length(level_labels)
+    @assert length(yA)==n && length(yB)==n
+    @assert length(degA)==n && length(degB)==n
+
+    x = 1:n
+    yA_plot = replace_nan_with_zero(yA)
+    yB_plot = replace_nan_with_zero(yB)
+    Y = hcat(yA_plot, yB_plot)
+
+    p = groupedbar(
+        x, Y;
         bar_position=:dodge,
-        legend=:topright,
         label=METHOD_LABELS,
         xticks=(x, level_labels),
         xrotation=25,
@@ -2652,6 +2831,7 @@ function grouped_bars(level_labels::Vector{String}, yA::Vector, yB::Vector;
         dpi=220,
         framestyle=:box,
         gridalpha=0.15,
+        legend=:topright,
         left_margin=12mm, right_margin=6mm,
         top_margin=10mm, bottom_margin=12mm
     )
@@ -2660,39 +2840,106 @@ function grouped_bars(level_labels::Vector{String}, yA::Vector, yB::Vector;
         ylims!(p, ylims)
     end
 
+    # Choose a small visible marker height
+    h = deg_height === nothing ? default_deg_height(yA_plot, yB_plot; ylims=ylims) : deg_height
+
+    # Approximate dodge geometry for 2-series groupedbar:
+    dx = 0.18
+    bw = 0.32
+
+    # Draw small bars + hatch lines
+    for i in 1:n
+        if degA[i]
+            xc = x[i] - dx
+            # draw outline bar
+            bar!(p, [xc], [h]; bar_width=bw, fillalpha=0.0, linecolor=:black, linewidth=2, label=nothing)
+            # hatch over the rectangle
+            hatch_rect!(p, xc - bw/2, xc + bw/2, 0.0, h; direction=:/, linewidth=1.2)
+        end
+        if degB[i]
+            xc = x[i] + dx
+            bar!(p, [xc], [h]; bar_width=bw, fillalpha=0.0, linecolor=:black, linewidth=2, label=nothing)
+            hatch_rect!(p, xc - bw/2, xc + bw/2, 0.0, h; direction=:\, linewidth=1.2)
+        end
+    end
+
     return p
 end
 
-"""
-    make_ablation_barplots(out)
 
-Given `out = ablation_main(...)`, returns Dict[sweep][metric] => plot,
-with 9 plots total (3 sweeps × 3 metrics).
-"""
+# """
+#     make_ablation_barplots(out)
+
+# Given `out = ablation_main(...)`, returns Dict[sweep][metric] => plot,
+# with 9 plots total (3 sweeps × 3 metrics).
+# """
+# function make_ablation_barplots(out)
+#     sumdict = out.summaries
+#     cache = out.cache
+
+#     plots = Dict{Symbol,Dict{Symbol,Any}}()
+
+#     for (sw, S) in sumdict
+#         levels = S.levels
+#         tick_labels = sweep_tick_labels_from_cache(cache, sw, levels)
+
+#         p_ess = grouped_bars(tick_labels, S.essA, S.essB;
+#             title=pretty_title(sw, :ess),
+#             xlabel=pretty_xlabel(sw),
+#             ylabel=pretty_ylabel(:ess),
+#             ylims=(0, out.meta[:n_particles])
+#         )
+
+#         p_rmse = grouped_bars(tick_labels, S.rmseA, S.rmseB;
+#             title=pretty_title(sw, :rmse),
+#             xlabel=pretty_xlabel(sw),
+#             ylabel=pretty_ylabel(:rmse)
+#         )
+
+#         p_acc = grouped_bars(tick_labels, S.accA, S.accB;
+#             title=pretty_title(sw, :acc),
+#             xlabel=pretty_xlabel(sw),
+#             ylabel=pretty_ylabel(:acc),
+#             ylims=(0, 1)
+#         )
+
+#         plots[sw] = Dict(:ess=>p_ess, :rmse=>p_rmse, :acc=>p_acc)
+#     end
+
+#     return plots
+# end
+
 function make_ablation_barplots(out)
     sumdict = out.summaries
-    cache = out.cache
-
-    plots = Dict{Symbol,Dict{Symbol,Any}}()
+    cache   = out.cache
+    plots   = Dict{Symbol,Dict{Symbol,Any}}()
 
     for (sw, S) in sumdict
         levels = S.levels
         tick_labels = sweep_tick_labels_from_cache(cache, sw, levels)
 
-        p_ess = grouped_bars(tick_labels, S.essA, S.essB;
+        # Degeneracy masks per metric: use collapsed flags + NaNs in that metric
+        degA_ess,  degB_ess  = degmask_from_summary(S.essA,  S.essB,  S.collapsedA, S.collapsedB)
+        degA_rmse, degB_rmse = degmask_from_summary(S.rmseA, S.rmseB, S.collapsedA, S.collapsedB)
+        degA_acc,  degB_acc  = degmask_from_summary(S.accA,  S.accB,  S.collapsedA, S.collapsedB)
+
+        p_ess = grouped_bars_with_degenerate_overlay(
+            tick_labels, S.essA, S.essB, degA_ess, degB_ess;
             title=pretty_title(sw, :ess),
             xlabel=pretty_xlabel(sw),
             ylabel=pretty_ylabel(:ess),
-            ylims=(0, out.meta[:n_particles])  # assumes you return this meta; see ablation_main patch below
+            ylims=(0, out.meta[:n_particles])
         )
 
-        p_rmse = grouped_bars(tick_labels, S.rmseA, S.rmseB;
+        p_rmse = grouped_bars_with_degenerate_overlay(
+            tick_labels, S.rmseA, S.rmseB, degA_rmse, degB_rmse;
             title=pretty_title(sw, :rmse),
             xlabel=pretty_xlabel(sw),
             ylabel=pretty_ylabel(:rmse)
         )
 
-        p_acc = grouped_bars(tick_labels, S.accA, S.accB;
+        p_acc = grouped_bars_with_degenerate_overlay(
+            tick_labels, S.accA, S.accB, degA_acc, degB_acc;
             title=pretty_title(sw, :acc),
             xlabel=pretty_xlabel(sw),
             ylabel=pretty_ylabel(:acc),
@@ -2816,7 +3063,13 @@ function plot_true_objective_vs_iqsips_rollout(cache::Dict, e;
     action_list = [as, a->Flux.onehot(a, as), Flux.onehotbatch(as, as)]
     π_dist = ScoreΠDist(; mdp_params=action_list)
 
-    pred_x, pred_y, _ = rollout_greedy_policy(π_dist, keyB; start_state=agent_params[:start_state], T=T)
+    # -------------------- FIX: ensure MDP exists for this key --------------------
+    cfgB = rec[:cfg]  # FourierDiscreteCfg used during ablation
+    ffB  = decode_fourier_key(keyB, cfgB)
+    ensure_mdp!(π_dist, keyB, ffB, agent_params)   # populates n_propmdp_list[keyB]
+    # ---------------------------------------------------------------------------
+
+    pred_x, pred_y, _ = rollout_greedy_policy(π_dist, keyB; start_state=agent_params[:start_state], T=10)
 
     p = heatmap(xs, ys, Z_true;
         aspect_ratio=1,
@@ -3087,6 +3340,7 @@ end
 println("Directory is: ", @__DIR__)
 
 script_dir = @__DIR__
+res_dir = script_dir*"/res"
 
 bson_path = script_dir*"/100_15_100_7_multi_trace_run.bson"
 
@@ -3094,10 +3348,10 @@ rng = MersenneTwister(0)
 
 out = ablation_main(bson_path;
     script_dir=script_dir,
-    mode=:load,   # or :generate
+    mode=:load,   # :generate or :load
     rng=rng,
     n_particles=50,
-    minN=100,
+    minN=150, # specifies number of data points to rollout
     iql_gridN=100,
     gridsize=120
 )
@@ -3119,14 +3373,14 @@ display(plots[:amp_range][:rmse])
 
 for (sw, pd) in plots
     for (metric, p) in pd
-        savefig(p, joinpath(script_dir, "$(sw)_$(metric).png"))
+        savefig(p, joinpath(res_dir, "$(sw)_$(metric).png"))
     end
 end
 
 figs = make_final_inference_figures(out; gridsize=200)
 display(figs.p1); display(figs.p2)
-savefig(figs.p1, joinpath(script_dir, "final_true_vs_iqsips_rollout.png"))
-savefig(figs.p2, joinpath(script_dir, "final_objective_triptych.png"))
+savefig(figs.p1, joinpath(res_dir, "final_true_vs_iqsips_rollout.png"))
+savefig(figs.p2, joinpath(res_dir, "final_objective_triptych.png"))
 
 # res = multi_run_test(script_dir*"/100_15_100_7_multi_trace_run.bson"; max_tests=200)
 

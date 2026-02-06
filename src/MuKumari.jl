@@ -91,6 +91,8 @@ function Base.show(io::IO, s::KAgentState)
     println(io, "\tAgent Location History: $(s.hist)")
 end
 
+Base.copy(s::KAgentState) = KAgentState(copy(s.x), copy(s.z), copy(s.hist))
+
 state(s::KAgentState) = s.x
 z(s::KAgentState) = s.z[end]
 t(s::KAgentState) = length(s.hist)
