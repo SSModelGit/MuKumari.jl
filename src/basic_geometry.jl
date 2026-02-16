@@ -90,6 +90,26 @@ function risk_check(xs::Matrix, xp::Matrix, pgon, width; debug::Bool=true, digit
         # take closest intersection point
         nearest_collision, col_dist = intersects_by_dists[1]
         if debug; println("Nearest collision: ", nearest_collision); println("Distance to nearest collision: ", col_dist); end
+
+        # NaN prevention squad
+        # if the intersection is at/near the start, avoid 0/0
+        if !isfinite(col_dist) || col_dist ≤ eps(Float64)
+            # cannot meaningfully move; keep current position
+            xp = xs
+        else
+            vec_reduction_frac = (col_dist - width) / col_dist
+            # If closer than width already, don't step past
+            if !isfinite(vec_reduction_frac) || vec_reduction_frac ≤ 0.0
+                xp = xs
+            else
+                xp = (nearest_collision .- xs) .* vec_reduction_frac .+ xs
+            end
+        end
+        # never return NaNs (brute force but whatever)
+        if any(!isfinite, xp)
+            xp = xs
+        end
+
         vec_reduction_frac = (col_dist - width) / col_dist
         xp = (nearest_collision .- xs) .* vec_reduction_frac .+ xs
     end
@@ -103,6 +123,12 @@ Also provides a quadrant breakdown of how many geometries are present in each qu
 """
 function nearest_k_geometries(loc::Matrix, geometries::Vector, k::Integer)
     tuple_loc = Tuple(loc)
+    # if loc is invalid, return a fixed-shape neutral observation - brute force but whatever
+    if any(!isfinite, tuple_loc)
+        field_count = zeros(8)
+        centers = fill((0.0, 0.0), Int(k))
+        return centers, field_count
+    end
     point = GI.Point(tuple_loc)
     field_count = zeros(8)
 
@@ -115,6 +141,11 @@ function nearest_k_geometries(loc::Matrix, geometries::Vector, k::Integer)
 
     # complete field count
     angles = [atan((c .- tuple_loc)...) for c in centers]
+    # 11th hour NaN catcher
+    if any(!isfinite, angles)
+        centers0 = fill((0.0, 0.0), Int(k))
+        return centers0, zeros(8)
+    end
     if any(isnan.(angles));
         println("Location: ", loc)
         println("Tuple-ified: ", tuple_loc)
