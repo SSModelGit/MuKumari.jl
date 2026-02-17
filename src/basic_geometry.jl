@@ -109,9 +109,6 @@ function risk_check(xs::Matrix, xp::Matrix, pgon, width; debug::Bool=true, digit
         if any(!isfinite, xp)
             xp = xs
         end
-
-        vec_reduction_frac = (col_dist - width) / col_dist
-        xp = (nearest_collision .- xs) .* vec_reduction_frac .+ xs
     end
 
     return round.(xp; digits=digits)
