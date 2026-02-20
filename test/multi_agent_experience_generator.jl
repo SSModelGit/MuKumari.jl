@@ -400,12 +400,15 @@ function write_multi_run_metadata(data_path::AbstractString;
 
     agent_names = isempty(agent_names) ? ["ag$(i)" for i in 1:n_agents] : agent_names
 
+    # use a compatible date format; Dates.ISODateTime is not defined
+    created_at_str = Dates.format(Dates.now(), dateformat"yyyy-mm-ddTHH:MM:SS")
+    
     toml = """
 schema_version = 1
 data_path = "$(data_abs)"
 format = "bson"
 data_type = "multi_run"
-created_at = "$(Dates.format(Dates.now(), Dates.ISODateTime))"
++created_at = "$(created_at_str)"
 created_by = "generated"
 notes = "Auto-generated multi-run metadata"
 
