@@ -18,6 +18,9 @@ using Crux
 using JLD2: @save, @load
 
 using Flux # Going to add this in now to start forming the networks
+using BSON
+using Dates
+
 ## Environment Feature types:
 # Surface:    :surf
 # Aerial:     :aer
@@ -280,7 +283,7 @@ function gen_experience(kworld::KWorld, name::String, ag_flist::Vector{Symbol}, 
 end
 
 """
-    main(; max_steps=30, sim_thresh=15, num_instances=10, plot_traces=false)
+    multi_agent_experience_generator(; max_steps=30, sim_thresh=15, num_instances=10, plot_traces=false)
 
 Main function for this file. Made to help generate data for future multi-agent objective inference and planning using the IQ-Learn technique.
 
@@ -297,7 +300,7 @@ Returns: `[kworld, data]`
         * Also contains `kworld` under the key "kworld"
         * Also contains a cumulative ExperienceBuffer under "total"
 """
-function main(; max_steps=30, sim_thresh=15, num_instances=10, plot_traces=false, max_agent_count=7)
+function multi_agent_experience_generator(; max_steps=30, sim_thresh=15, num_instances=10, plot_traces=false, max_agent_count=7)
     # define KWorld object
     dims = (0., 10.)
     kworld = init_world((0., 10.), [:sub, :surf, :aer]; num_obcs=5, num_goals=3)
@@ -347,6 +350,92 @@ function main(; max_steps=30, sim_thresh=15, num_instances=10, plot_traces=false
     # data = Dict([(k, gen_experience(kworld, agent_mdps[k], agent_beliefs[k]; max_steps=max_steps, sim_thresh=sim_thresh)) for k in keys(agent_mdps)])
 
     # return kworld, agent_mdps, agent_beliefs, data
+end
+
+
+"""
+    write_multi_run_metadata(meta_path, data_path; kwargs...)
+
+Write a simple TOML metadata file describing a multi-run dataset. This helper
+is used by tests/examples that generate multi-agent experience bundles so that
+a companion metadata file exists next to the generated BSON.
+"""
+function write_multi_run_metadata(data_path::AbstractString; 
+                                  n_agents::Int=1, agent_names::Vector{String}=String[], runs_per_agent::Int=1,
+                                  run_index_key::String="ind_exps", run_container_key::String="runs",
+                                  full_key::String="full_data", anon_key::String="anon_data",
+                                  state_field_sizes::Vector{Int}=[2,2,12,10,1],
+                                  state_field_names::Vector{String}=["loc","vel","obcs","goals","time"],
+                                  keep_state_fields::Vector{Bool}=[true,true,true,false,true],
+                                  anonize_first_rows::Int=2)
+    """
+    Create a multi-run metadata file for the given data path.
+    
+    The metadata file is saved following the strict naming convention:
+    <data_file>.meta.toml (e.g., "experiment.bson" → "experiment.meta.toml")
+    
+    # Arguments:
+    - `data_path`: Absolute or relative path to the BSON data file
+    - `n_agents`: Number of agents in the multi-run experiment
+    - `agent_names`: Vector of agent identifiers
+    - `runs_per_agent`: Number of runs per agent
+    - `run_index_key`: Key identifying the run index in the BSON
+    - `run_container_key`: Key for the container of all runs
+    - `full_key`, `anon_key`: Keys for full and anonymized data buffers
+    - `state_field_sizes`, `state_field_names`, `keep_state_fields`: State metadata
+    - `anonize_first_rows`: Number of initial state rows to anonymize
+    
+    # Returns:
+    - The absolute path to the generated metadata file
+    """
+    
+    # Compute metadata path from data path using naming convention
+    data_abs = abspath(data_path)
+    base_path, _ = splitext(data_abs)
+    meta_path = base_path * ".meta.toml"
+    
+    # ensure folder exists
+    dir = dirname(meta_path)
+    isdir(dir) || mkpath(dir)
+
+    agent_names = isempty(agent_names) ? ["ag$(i)" for i in 1:n_agents] : agent_names
+
+    toml = """
+schema_version = 1
+data_path = "$(data_abs)"
+format = "bson"
+data_type = "multi_run"
+created_at = "$(Dates.format(Dates.now(), Dates.ISODateTime))"
+created_by = "generated"
+notes = "Auto-generated multi-run metadata"
+
+# top-level multi-run info
+n_agents = $(n_agents)
+agent_names = [$(join(map(a->"\""*a*"\"", agent_names), ","))]
+runs_per_agent = $(runs_per_agent)
+run_index_key = "$(run_index_key)"
+agent_key_pattern = "ag%s"
+
+[loader]
+run_container_key = "$(run_container_key)"
+agent_entry_key = ""
+full_key = "$(full_key)"
+anon_key = "$(anon_key)"
+expected_keys = ["s","sp","a","r"]
+unpack_strategy = "runs-array"
+
+[state]
+state_field_sizes = [$(join(state_field_sizes, ", "))]
+state_field_names = [$(join(map(s->"\""*s*"\"", state_field_names), ", "))]
+keep_state_fields = [$(join(map(b->string(b), keep_state_fields), ", "))]
+anonize_first_rows = $(anonize_first_rows)
+auto_clean = true
+"""
+
+    open(meta_path, "w") do io
+        write(io, toml)
+    end
+    return meta_path
 end
 
 """
@@ -407,6 +496,66 @@ function get_experience_data(;max_steps=10000, sim_thresh=15, update_progress=fa
     return kworld,
            ExperienceBuffer(data, max_steps, 1, Array{Int64}[], nothing, 0),
            ExperienceBuffer(anonymized_location_data, max_steps, 1, Array{Int64}[], nothing, 0)
+end
+
+"""
+    main(; max_steps=30, sim_thresh=15, num_instances=10, plot_traces=false, max_agent_count=7)
+
+Generate multi-agent experience data and save to persistent BSON with metadata.
+
+This function wraps `multi_agent_experience_generator` and handles saving the generated data
+to disk alongside metadata that describes the dataset structure and provenance.
+
+# Arguments:
+- `max_steps`: maximum timestep observations per agent instance
+- `sim_thresh`: max steps to run any agent simulation
+- `num_instances`: number of agent instantiations to simulate per agent MDP
+- `plot_traces`: currently unused
+- `max_agent_count`: limit on the number of agents to generate (max 7)
+
+# Behavior:
+Generates multi-agent experience data and saves to a BSON file following the naming convention:
+`<max_steps>_<sim_thresh>_<num_instances>_<max_agent_count>_multi_trace_run.bson`
+
+Automatically creates a companion metadata file (`.meta.toml`) describing the dataset.
+
+# Returns:
+- `kworld`: KWorld object with all agent MDPs
+- `data`: Dictionary of all agent experiences and metadata
+"""
+function main(; max_steps=30, sim_thresh=15, num_instances=10, plot_traces=false, max_agent_count=7)
+    # Generate the experience data
+    kworld, data = multi_agent_experience_generator(; 
+                                                     max_steps=max_steps, 
+                                                     sim_thresh=sim_thresh,
+                                                     num_instances=num_instances, 
+                                                     plot_traces=plot_traces,
+                                                     max_agent_count=max_agent_count)
+    
+    # Determine actual number of agents generated
+    actual_agent_count = min(7, max_agent_count)  # 7 agents defined in multi_agent_experience_generator
+    agent_names = ["ag$i" for i in 1:actual_agent_count]
+    
+    # Create output directory
+    output_dir = joinpath(@__DIR__, "expert_data")
+    
+    # Generate filename according to convention: <max_steps>_<sim_thresh>_<num_instances>_<max_agent_count>_multi_trace_run.bson
+    filename = "$(max_steps)_$(sim_thresh)_$(num_instances)_$(max_agent_count)_multi_trace_run.bson"
+    data_path = joinpath(output_dir, filename)
+    
+    # Save BSON data
+    BSON.@save data_path data kworld
+    println("Saved BSON data to: $data_path")
+    
+    # Write metadata with same parameters as generation
+    write_multi_run_metadata(data_path; 
+                            n_agents=actual_agent_count, 
+                            agent_names=agent_names,
+                            runs_per_agent=num_instances,
+                            run_index_key="ind_exps")
+    println("Wrote metadata for dataset")
+    
+    return kworld, data
 end
 
 # # use BSON loader otherwise
