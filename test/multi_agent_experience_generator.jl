@@ -325,6 +325,8 @@ function multi_agent_experience_generator(; max_steps=30, sim_thresh=15, num_ins
     generate_showvalues(sn) = () -> [("Agent #", sn)]
     updater = Progress(length(ag_flists); desc="Generating expert data...", offset=1)
     for (i, p) in enumerate(ag_flists)
+        # if we're crossing the upper limit of simulations, finish.
+        if i > max_agent_count; break; end
         # generate data for agent
         data[p[1]] = gen_experience(kworld, p[1], p[2], num_instances; max_steps=max_steps, sim_thresh=sim_thresh, updater_offset=3)
 
@@ -337,8 +339,6 @@ function multi_agent_experience_generator(; max_steps=30, sim_thresh=15, num_ins
 
         # update progress bar
         next!(updater, showvalues=generate_showvalues(i))
-        # if we're crossing the upper limit of simulations, finish.
-        if i > max_agent_count; break; end
     end
 
     # store cumulative buffer
@@ -408,7 +408,7 @@ schema_version = 1
 data_path = "$(data_abs)"
 format = "bson"
 data_type = "multi_run"
-+created_at = "$(created_at_str)"
+created_at = "$(created_at_str)"
 created_by = "generated"
 notes = "Auto-generated multi-run metadata"
 
