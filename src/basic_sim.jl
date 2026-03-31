@@ -41,13 +41,48 @@ function stepthrough_sim(pomdp::KAgentPOMDP, planner::AbstractMCTSPlanner, bup::
     step = 0
     for (b,s,a,o,r) in stepthrough(pomdp, planner, bup, "b,s,a,o,r", max_steps=max_steps)
         step += 1
-        println("Step $step")
-        println("Has belief: $b")
-        println("in state:\n$s")
-        println("took action: $a")
-        println("Received observation: $o")
-        println("received reward: $r")
-        println("--------------------\n")
+        if plot_sim_trace
+            println("Step $step")
+            println("Has belief: $b")
+            println("in state:\n$s")
+            println("took action: $a")
+            println("Received observation: $o")
+            println("received reward: $r")
+            println("--------------------\n")
+        end
+        push!(sim_trace, [s, a])
+    end
+
+    push!(sim_trace, [@gen(:sp)(pomdp, sim_trace[end][1], sim_trace[end][2]), :c])
+
+    if plot_sim_trace
+        f = viz_system_sim(pomdp, pomdp.objl, sim_trace)
+        return (sim_trace, f)
+    end
+
+    return sim_trace
+end
+
+"""
+    stepthrough_sim(pomdp::KAgentPOMDP, policy, bup::KAgentBeliefUpdater, max_steps::Integer=10; plot_sim_trace=false)
+
+Simulate the POMDP using a learned policy (from Crux) instead of a planner.
+Returns the same sim_trace format as the planner version.
+"""
+function stepthrough_sim(pomdp::KAgentPOMDP, policy, bup::KAgentBeliefUpdater, max_steps::Integer=10; plot_sim_trace=false)
+    sim_trace = Any[]
+    step = 0
+    for (b,s,a,o,r) in stepthrough(pomdp, policy, bup, "b,s,a,o,r", max_steps=max_steps)
+        step += 1
+        if plot_sim_trace
+            println("Step $step")
+            println("Has belief: $b")
+            println("in state:\n$s")
+            println("took action: $a")
+            println("Received observation: $o")
+            println("received reward: $r")
+            println("--------------------\n")
+        end
         push!(sim_trace, [s, a])
     end
 
@@ -89,7 +124,7 @@ Will produce a dictionary with the following fields:
 """
 function expert_simulator(pomdp::KAgentPOMDP, planner::AbstractMCTSPlanner, bup::KAgentBeliefUpdater;
                           max_steps=10000, sim_limit=15, obs_dims::Union{Nothing, Integer}=nothing,
-                          debug_progress=false, updater_offset=1)
+                          debug_progress=false, updater_offset=1, nonterminal_system::Bool=false)
     step_counter = 1 # this is used to index arrays; use one-indexing
     sim_counter = 0 # used to track number of sims taken; use zero-indexing
 
@@ -145,8 +180,20 @@ function expert_simulator(pomdp::KAgentPOMDP, planner::AbstractMCTSPlanner, bup:
                 # avoid struggling to find a suitable simulation when we're close enough to the end
                 break
             end
+        elseif nonterminal_system
+            for (j, i) in enumerate(step_counter:min(step_counter+step-1, max_steps))
+                a_list[:,i]   .= single_trace[j][4]
+                s_list[:,i]   .= shape_state_as_obs(pomdp, single_trace[j][1])
+                sp_list[:,i]  .= shape_state_as_obs(pomdp, single_trace[j][2])
+                r_list[1,i]    = single_trace[j][5]
+                t_list[1,i]    = single_trace[j][6]
+                done_list[1,i] = single_trace[j][7]
+            end
+            step_counter += step
+            update!(p1, step_counter; showvalues=generate_showvalues(step_counter))
         end
     end
+    step_counter = min(step_counter, max_steps)
 
     return Dict(:a => a_list[:,1:step_counter-1],
                 :s => s_list[:,1:step_counter-1],
