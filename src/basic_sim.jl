@@ -64,36 +64,27 @@ function stepthrough_sim(pomdp::KAgentPOMDP, planner::AbstractMCTSPlanner, bup::
 end
 
 """
-    stepthrough_sim(pomdp::KAgentPOMDP, policy, bup::KAgentBeliefUpdater, max_steps::Integer=10; plot_sim_trace=false)
+    stepthrough_sim(pomdp::KAgentPOMDP, policy, max_steps::Integer=10)
 
-Simulate the POMDP using a learned policy (from Crux) instead of a planner.
-Returns the same sim_trace format as the planner version.
+Manually simulate the POMDP using a learned policy from Crux.
 """
-function stepthrough_sim(pomdp::KAgentPOMDP, policy, bup::KAgentBeliefUpdater, max_steps::Integer=10; plot_sim_trace=false)
+function stepthrough_sim(pomdp::KAgentPOMDP, policy, max_steps::Integer=10)
     sim_trace = Any[]
-    step = 0
-    for (b,s,a,o,r) in stepthrough(pomdp, policy, bup, "b,s,a,o,r", max_steps=max_steps)
-        step += 1
-        if plot_sim_trace
-            println("Step $step")
-            println("Has belief: $b")
-            println("in state:\n$s")
-            println("took action: $a")
-            println("Received observation: $o")
-            println("received reward: $r")
-            println("--------------------\n")
-        end
+    s = rand(initialstate(pomdp))
+
+    for step in 1:max_steps
+        obs_vec = shape_state_as_obs(pomdp, s)
+        a = action(policy, obs_vec)[1]
+
+        sp = @gen(:sp)(pomdp, s, a)
+
         push!(sim_trace, [s, a])
+        s = sp
     end
 
     push!(sim_trace, [@gen(:sp)(pomdp, sim_trace[end][1], sim_trace[end][2]), :c])
 
-    if plot_sim_trace
-        f = viz_system_sim(pomdp, pomdp.objl, sim_trace)
-        return (sim_trace, f)
-    end
-
-    return (sim_trace,)
+    return sim_trace
 end
 
 onehot_action_encoder(pomdp::KAgentPOMDP) = a->onehot(a, actions(pomdp))
