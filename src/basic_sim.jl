@@ -64,13 +64,19 @@ function stepthrough_sim(pomdp::KAgentPOMDP, planner::AbstractMCTSPlanner, bup::
 end
 
 """
-    stepthrough_sim(pomdp::KAgentPOMDP, policy, max_steps::Integer=10)
+    stepthrough_sim(pomdp::KAgentPOMDP, policy, max_steps::Integer=10; start_state=nothing)
 
 Manually simulate the POMDP using a learned policy from Crux.
+
+# Arguments
+- `pomdp::KAgentPOMDP`: The POMDP environment
+- `policy`: Learned policy from Crux
+- `max_steps::Integer`: Number of steps to simulate (default: 10)
+- `start_state`: Optional starting state. If nothing, samples from initialstate(pomdp)
 """
-function stepthrough_sim(pomdp::KAgentPOMDP, policy, max_steps::Integer=10)
+function stepthrough_sim(pomdp::KAgentPOMDP, policy, max_steps::Integer=10; start_state=nothing)
     sim_trace = Any[]
-    s = rand(initialstate(pomdp))
+    s = isnothing(start_state) ? rand(initialstate(pomdp)) : start_state
 
     for step in 1:max_steps
         obs_vec = shape_state_as_obs(pomdp, s)
